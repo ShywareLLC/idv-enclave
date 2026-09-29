@@ -1,0 +1,16 @@
+{
+  "name": "populist-idv-enclave",
+  "version": "0.1.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "better-sqlite3": "^12.4.1",
+    "oci-common": "^2.109.0",
+    "oci-secrets": "^2.109.0",
+    "oci-objectstorage": "^2.109.0"
+  }
+}
