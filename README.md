@@ -42,6 +42,17 @@ per the docs page above.
 - `GET /pubkey`, `GET /poll-pubkey`, `GET /health` — public, unauthenticated;
   the two pubkey endpoints are meant to be published and pinned by consumers
   (`--didit-pubkey` / `--operator-pubkey-pem-file` on the Go core validator).
+- `POST /register-device`, `GET /device-key/{keyId}`, `DELETE /device-key/{keyId}`
+  — durable storage for Apple App Attest device keys, backed by its own OCI
+  Object Storage bucket (deliberately separate from the audit-log bucket:
+  device records must be deletable on de-registration, and the audit log's
+  retention rule is WORM). This service does not itself verify App Attest
+  attestations -- that real cryptographic work already exists and is tested
+  in Go (`ShywareLLC/core`'s `services/attest.AppAttestVerifier`); these
+  three endpoints exist purely so that verification's key store survives a
+  relay process restarting, via `services/attest.EnclaveKeyStore`. Shared-secret
+  gated, for the same reason as `/sign-poll-create`: there's no independent
+  third party to check a store/load request against.
 
 ## Configuration (all via environment, nothing hardcoded)
 
@@ -51,6 +62,8 @@ per the docs page above.
 | `AUDIT_LOG_SHARED_SECRET` | Bearer secret gating `POST /audit-log` |
 | `AUDIT_LOG_NAMESPACE`, `AUDIT_LOG_BUCKET` | OCI Object Storage target for audit records |
 | `POLL_SIGNING_SHARED_SECRET` | Bearer secret gating `POST /sign-poll-create` |
+| `DEVICE_KEY_SHARED_SECRET` | Bearer secret gating the three `/register-device` / `/device-key` endpoints |
+| `DEVICE_KEY_BUCKET` | OCI Object Storage bucket for device-key records (same namespace as `AUDIT_LOG_NAMESPACE`, separate bucket -- see above) |
 | `PORT` (default `8443`), `TLS_KEY_PATH`, `TLS_CERT_PATH` | Listen config; runs plain HTTP if TLS paths aren't set (put a TLS-terminating proxy in front in that case) |
 
 Signing keys and the local replay-tracking SQLite database live under

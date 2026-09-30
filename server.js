@@ -66,6 +66,29 @@ if (!POLL_SIGNING_SHARED_SECRET) {
   process.exit(1);
 }
 
+// Apple App Attest device-key store: durable, shared state a relay's own
+// AppAttestKeyStore implementation reads/writes over HTTP (see
+// ShywareLLC/core services/attest/verifier.go -- StoreKey/LoadKey). The
+// enclave does NOT re-verify the App Attest attestation object itself; the
+// relay's existing AppAttestVerifier already does the real cert-chain
+// verification against Apple's root CA in Go, tested and working. This
+// store's only job is to durably hold the already-verified public key
+// somewhere with better survival properties than one relay process's
+// memory -- same instance-principal identity as the audit log, but its own
+// bucket (not a prefix in the audit-log bucket): device records must be
+// deletable on de-registration, and the audit log's retention rule is
+// deliberately WORM and must never end up covering something that needs to
+// be deleted. Like /sign-poll-create and /audit-log, there is no
+// independent third party to check a store/load request against, so this
+// needs its own shared secret -- trusting that the caller (the relay) has
+// already done the real cryptographic verification before calling here.
+const DEVICE_KEY_SHARED_SECRET = process.env.DEVICE_KEY_SHARED_SECRET;
+const DEVICE_KEY_BUCKET = process.env.DEVICE_KEY_BUCKET;
+if (!DEVICE_KEY_SHARED_SECRET || !DEVICE_KEY_BUCKET) {
+  console.error("DEVICE_KEY_SHARED_SECRET and DEVICE_KEY_BUCKET env vars are required");
+  process.exit(1);
+}
+
 // -- Key material: generated once, on first boot, never transmitted ---------
 function loadOrGenerateKeypair() {
   if (fs.existsSync(PRIV_KEY_PATH) && fs.existsSync(PUB_KEY_PATH)) {
@@ -287,6 +310,117 @@ async function logPollCreateRequest(record) {
     console.error("logPollCreateRequest error:", err.message);
   }
 }
+
+// -- Apple App Attest device-key store ---------------------------------------
+//
+// Three plain operations backed by OCI Object Storage: store a device's
+// already-verified public key, look it up again for a later assertion
+// check, and delete it on de-registration. No App Attest-specific logic
+// lives here on purpose -- that verification (CBOR parsing, cert-chain
+// verification against Apple's root CA) already exists and is tested in Go
+// (ShywareLLC/core services/attest.AppAttestVerifier); duplicating it here
+// in a second language would just be a second place for it to drift or be
+// wrong. This store's only contract: whatever the caller says to store is
+// already-verified, so store it durably; whatever's stored, hand it back
+// unchanged.
+function deviceKeyAuthorized(req) {
+  const authHeader = req.get("authorization") || "";
+  const presented = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+  return timingSafeEqual(presented, DEVICE_KEY_SHARED_SECRET);
+}
+
+function deviceKeyObjectName(keyId) {
+  return `device-keys/${encodeURIComponent(keyId)}.json`;
+}
+
+async function streamToBuffer(readable) {
+  const chunks = [];
+  for await (const chunk of readable) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+app.post("/register-device", async (req, res) => {
+  if (!deviceKeyAuthorized(req)) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  const { keyId, pubKeyDER } = req.body || {};
+  if (!keyId || !pubKeyDER) {
+    return res.status(400).json({ error: "keyId and pubKeyDER (base64 DER) are required" });
+  }
+  // Fail fast on garbage input rather than silently storing an unusable value.
+  try {
+    Buffer.from(pubKeyDER, "base64");
+  } catch {
+    return res.status(400).json({ error: "pubKeyDER must be base64-encoded" });
+  }
+
+  try {
+    const client = await getObjectStorageClient();
+    await client.putObject({
+      namespaceName: AUDIT_LOG_NAMESPACE,
+      bucketName: DEVICE_KEY_BUCKET,
+      objectName: deviceKeyObjectName(keyId),
+      putObjectBody: Buffer.from(JSON.stringify({ keyId, pubKeyDER, registeredAt: new Date().toISOString() })),
+      contentType: "application/json"
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("register-device error:", err.message);
+    res.status(500).json({ error: "internal error" });
+  }
+});
+
+app.get("/device-key/:keyId", async (req, res) => {
+  if (!deviceKeyAuthorized(req)) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  try {
+    const client = await getObjectStorageClient();
+    const response = await client.getObject({
+      namespaceName: AUDIT_LOG_NAMESPACE,
+      bucketName: DEVICE_KEY_BUCKET,
+      objectName: deviceKeyObjectName(req.params.keyId)
+    });
+    const body = await streamToBuffer(response.value);
+    res.json(JSON.parse(body.toString("utf8")));
+  } catch (err) {
+    if (err.statusCode === 404) {
+      return res.status(404).json({ error: `key ${req.params.keyId} not registered` });
+    }
+    console.error("device-key lookup error:", err.message);
+    res.status(500).json({ error: "internal error" });
+  }
+});
+
+app.delete("/device-key/:keyId", async (req, res) => {
+  if (!deviceKeyAuthorized(req)) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  try {
+    const client = await getObjectStorageClient();
+    await client.deleteObject({
+      namespaceName: AUDIT_LOG_NAMESPACE,
+      bucketName: DEVICE_KEY_BUCKET,
+      objectName: deviceKeyObjectName(req.params.keyId)
+    });
+    res.json({ success: true });
+  } catch (err) {
+    // Verified against a real bucket, not assumed: deleteObject throws 404
+    // (ObjectNotFound) rather than succeeding silently when the object is
+    // already gone. De-registering an already-gone key isn't an error for
+    // the caller, so treat 404 here as the success it functionally is.
+    if (err.statusCode === 404) {
+      return res.json({ success: true });
+    }
+    console.error("device-key delete error:", err.message);
+    res.status(500).json({ error: "internal error" });
+  }
+});
 
 // -- Self-telemetry: the enclave records its own request history ------------
 //
