@@ -65,6 +65,25 @@ per the docs page above.
 | `DEVICE_KEY_SHARED_SECRET` | Bearer secret gating the three `/register-device` / `/device-key` endpoints |
 | `DEVICE_KEY_BUCKET` | OCI Object Storage bucket for device-key records (same namespace as `AUDIT_LOG_NAMESPACE`, separate bucket -- see above) |
 | `PORT` (default `8443`), `TLS_KEY_PATH`, `TLS_CERT_PATH` | Listen config; runs plain HTTP if TLS paths aren't set (put a TLS-terminating proxy in front in that case) |
+| `RELAY_BASE_URL` | Optional. The relay's own base URL (e.g. `https://admin.yourdomain.com`), used by `/attest`'s replay-guard grace window to check whether a poll is still open before letting a different key take over an already-consumed `(session_id, poll_id)` slot. If unset, the grace window simply never opens -- a slot locks permanently on the first key it sees, same as before this feature existed. Not required for the service's core guarantee. |
+
+### `/attest`'s local replay guard and grace window
+
+`consumed_sessions` (SQLite, local to this instance) is defense-in-depth
+only -- the real, authoritative "one Didit session, one vote, ever" rule is
+enforced by the chain itself (`ShywareLLC/core`'s `s.consumedSessions`, keyed
+by `session_id` alone, globally), not by this table. This table's job is
+narrower: it's keyed by `(session_id, poll_id)` and exists so a retry with
+the *same* key is idempotent rather than erroring.
+
+A different key for an already-consumed `(session_id, poll_id)` pair is
+normally rejected (`409`). If `RELAY_BASE_URL` is set, the handler checks the
+poll's current status first and allows the reassignment when the poll is
+still open (`"open"` or `"pending"`) -- a transient failure after the first
+signature shouldn't permanently orphan the poll for that session. This is
+deliberately anchored to poll lifecycle (something an operator already
+controls, by closing the poll) rather than a fixed timer baked into this
+service.
 
 Signing keys and the local replay-tracking SQLite database live under
 `/etc/populist-idv-enclave/` (path is currently hardcoded — parameterizing
