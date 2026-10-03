@@ -66,6 +66,18 @@ if (!POLL_SIGNING_SHARED_SECRET) {
   process.exit(1);
 }
 
+// Used by /attest's replay-guard grace window (see below) to ask the relay
+// whether a poll is still open before allowing a different key to take over
+// an already-consumed (session_id, poll_id) slot. The enclave otherwise has
+// no knowledge of poll state at all -- this is a new dependency, not a
+// config tweak -- and is deliberately optional: if unset, the grace window
+// simply never opens (today's permanent-lock behavior), rather than failing
+// to start, since this isn't required for the enclave's core guarantee.
+const RELAY_BASE_URL = process.env.RELAY_BASE_URL || null;
+if (!RELAY_BASE_URL) {
+  console.log("RELAY_BASE_URL not set -- /attest's replay-guard grace window is disabled (permanent per-poll lock on first key, as before).");
+}
+
 // Apple App Attest device-key store: durable, shared state a relay's own
 // AppAttestKeyStore implementation reads/writes over HTTP (see
 // ShywareLLC/core services/attest/verifier.go -- StoreKey/LoadKey). The
@@ -250,6 +262,26 @@ async function checkDiditSession(sessionId) {
     throw new Error(`Didit API returned ${res.status}`);
   }
   return res.json();
+}
+
+// Used by /attest's replay-guard grace window: a (session_id, poll_id) slot
+// that's already been consumed by a different key may still be reassigned
+// to a new key as long as the poll itself is still open -- this ties the
+// window to something an operator already controls (closing the poll),
+// rather than an arbitrary timer baked into this service. Fails closed: any
+// error, a non-"open"/"pending" status, or RELAY_BASE_URL being unset all
+// return false (no reassignment), matching today's permanent-lock behavior
+// rather than silently opening the window on a relay hiccup.
+async function isPollOpen(pollId) {
+  if (!RELAY_BASE_URL) return false;
+  try {
+    const res = await fetch(`${RELAY_BASE_URL.replace(/\/$/, "")}/polls/${encodeURIComponent(pollId)}`);
+    if (!res.ok) return false;
+    const poll = await res.json();
+    return poll.status === "open" || poll.status === "pending";
+  } catch {
+    return false;
+  }
 }
 
 const app = express();
@@ -528,13 +560,28 @@ app.post("/attest", async (req, res) => {
     // Local replay guard (defense-in-depth; see comment above the table def).
     // Scoped to (session_id, poll_id) -- this session may already have a
     // *different* poll's row in the table, which is fine and expected, not
-    // a conflict. Only a different key for the SAME poll is a conflict.
+    // a conflict. Only a different key for the SAME poll is a conflict --
+    // unless the poll is still open, in which case the grace window below
+    // lets the new key take over (a transient failure after the first
+    // signature shouldn't permanently orphan the poll for this session).
+    let reassigned = false;
     const existing = db.prepare(
       "SELECT voter_pub_key FROM consumed_sessions WHERE session_id = ? AND poll_id = ?"
     ).get(session_id, poll_id);
     if (existing) {
       if (existing.voter_pub_key === voter_pub_key) {
         // Same request retried (e.g. client timeout+retry) -- idempotent, not an attack.
+      } else if (await isPollOpen(poll_id)) {
+        // Grace window: poll hasn't closed yet, so a different key may
+        // reassign this slot. Does not touch consumedSessions on-chain
+        // (ballots.go) -- that's the actual, authoritative one-session-ever
+        // enforcement and is unaffected either way; this only ever matters
+        // pre-commit.
+        db.prepare(
+          "UPDATE consumed_sessions SET voter_pub_key = ? WHERE session_id = ? AND poll_id = ?"
+        ).run(voter_pub_key, session_id, poll_id);
+        reassigned = true;
+        await logAttestRequest({ timestamp, caller, session_id, poll_id, outcome: "replay_grace_reassigned", httpStatus: 200 });
       } else {
         await logAttestRequest({ timestamp, caller, session_id, poll_id, outcome: "replay_conflict", httpStatus: 409 });
         return res.status(409).json({ error: "session_id already consumed a different key for this poll" });
@@ -574,7 +621,8 @@ app.post("/attest", async (req, res) => {
       idv_attestation_sig: signature.toString("hex"),
       voter_pub_key,
       poll_id,
-      session_id
+      session_id,
+      ...(reassigned ? { replay_grace_reassigned: true } : {})
     });
   } catch (err) {
     console.error("attest error:", err.message);
