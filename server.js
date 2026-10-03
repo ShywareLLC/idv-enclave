@@ -41,6 +41,8 @@ const PRIV_KEY_PATH = path.join(KEY_DIR, "enclave_ed25519.pem");
 const PUB_KEY_PATH = path.join(KEY_DIR, "enclave_ed25519_pub.pem");
 const POLL_PRIV_KEY_PATH = path.join(KEY_DIR, "enclave_poll_rsa.pem");
 const POLL_PUB_KEY_PATH = path.join(KEY_DIR, "enclave_poll_rsa_pub.pem");
+const REGISTRATION_PRIV_KEY_PATH = path.join(KEY_DIR, "enclave_registration_ed25519.pem");
+const REGISTRATION_PUB_KEY_PATH = path.join(KEY_DIR, "enclave_registration_ed25519_pub.pem");
 const DB_PATH = path.join(KEY_DIR, "consumed-sessions.db");
 
 const DIDIT_SECRET_OCID = process.env.DIDIT_SECRET_OCID;
@@ -154,6 +156,39 @@ function loadOrGenerateRSAKeypair() {
 const { privateKey: POLL_PRIVATE_KEY_PEM, publicKey: POLL_PUBLIC_KEY_PEM } = loadOrGenerateRSAKeypair();
 const POLL_PRIVATE_KEY_OBJ = crypto.createPrivateKey(POLL_PRIVATE_KEY_PEM);
 
+// -- Registration-binding signing key: separate Ed25519 keypair, same
+// generated-once-never-exported pattern as the two keys above. Separate
+// key (not the same one /attest uses) so a compromise of one signing
+// purpose -- device/browser registration binding -- doesn't also
+// compromise per-poll ballot attestation, and so each key's exposure is
+// scoped to exactly one capability, consistent with why the poll-creation
+// key above is already its own separate key rather than reusing the
+// /attest key. This is what gets configured as the Go core's registration
+// verifier pubkey (new flag, see ShywareLLC/core's RegisteredCredentialVerifier).
+function loadOrGenerateRegistrationKeypair() {
+  if (fs.existsSync(REGISTRATION_PRIV_KEY_PATH) && fs.existsSync(REGISTRATION_PUB_KEY_PATH)) {
+    return {
+      privateKey: fs.readFileSync(REGISTRATION_PRIV_KEY_PATH, "utf8"),
+      publicKey: fs.readFileSync(REGISTRATION_PUB_KEY_PATH, "utf8")
+    };
+  }
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  const privPem = privateKey.export({ type: "pkcs8", format: "pem" });
+  const pubPem = publicKey.export({ type: "spki", format: "pem" });
+  fs.mkdirSync(KEY_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(REGISTRATION_PRIV_KEY_PATH, privPem, { mode: 0o600 });
+  fs.writeFileSync(REGISTRATION_PUB_KEY_PATH, pubPem, { mode: 0o644 });
+  console.log("Generated new registration-binding signing keypair -- this only happens once, ever.");
+  return { privateKey: privPem, publicKey: pubPem };
+}
+
+const { privateKey: REGISTRATION_PRIVATE_KEY_PEM, publicKey: REGISTRATION_PUBLIC_KEY_PEM } = loadOrGenerateRegistrationKeypair();
+const REGISTRATION_PRIVATE_KEY_OBJ = crypto.createPrivateKey(REGISTRATION_PRIVATE_KEY_PEM);
+const REGISTRATION_PUBLIC_KEY_OBJ = crypto.createPublicKey(REGISTRATION_PUBLIC_KEY_PEM);
+const REGISTRATION_PUBLIC_KEY_HEX = REGISTRATION_PUBLIC_KEY_OBJ.export({ type: "spki", format: "der" })
+  .subarray(-32)
+  .toString("hex");
+
 // -- Local one-time-use tracking (defense-in-depth only) --------------------
 // The AUTHORITATIVE enforcement against session replay belongs on-chain
 // (reject a registration tx whose didit_session_id has been seen before,
@@ -207,6 +242,21 @@ if (existingSchema && existingSchema.sql && !existingSchema.sql.includes("PRIMAR
   `);
   console.log("Migration complete.");
 }
+
+// Session-scoped only (no poll_id) -- registration is a one-time, per-device
+// event, not a per-poll one. Defense-in-depth only, same caveat as
+// consumed_sessions above: the chain's own s.consumedSessions (keyed by
+// session_id alone, global) is the real, authoritative one-session-ever
+// enforcement for TxTypeRegisterIdentity too -- this table only keeps this
+// one enclave instance from signing two different registration pubkeys for
+// the same session.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS consumed_registrations (
+    session_id TEXT PRIMARY KEY,
+    registration_pub_key TEXT NOT NULL,
+    consumed_at TEXT NOT NULL
+  )
+`);
 
 // -- Didit API key: fetched once via instance-principal auth, kept only in
 // memory, never logged, never returned by any endpoint. ---------------------
@@ -295,6 +345,14 @@ app.get("/health", (_req, res) => {
 // --didit-pubkey. Not secret; this is meant to be published/verifiable.
 app.get("/pubkey", (_req, res) => {
   res.json({ publicKeyHex: PUBLIC_KEY_HEX, publicKeyPem: PUBLIC_KEY_PEM });
+});
+
+// Returns the registration-binding signing key's public half -- this is
+// what an operator configures as the Go core's registration verifier
+// pubkey (new flag, RegisteredCredentialVerifier). Not secret, same
+// reasoning as /pubkey above.
+app.get("/registration-pubkey", (_req, res) => {
+  res.json({ publicKeyHex: REGISTRATION_PUBLIC_KEY_HEX, publicKeyPem: REGISTRATION_PUBLIC_KEY_PEM });
 });
 
 // Returns the poll-creation signing key's public half -- this is what an
@@ -630,6 +688,97 @@ app.post("/attest", async (req, res) => {
       timestamp, caller,
       session_id: session_id || null, poll_id: poll_id || null,
       outcome: "internal_error", errorMessage: err.message, httpStatus: 500
+    });
+    res.status(500).json({ error: "internal error" });
+  }
+});
+
+// -- Browser/device credential registration ----------------------------------
+//
+// Part of the registered-credential embodiment (one real Didit session per
+// device, instead of one per vote): given {session_id, registration_pub_key},
+// independently confirms the session with Didit's real API (same as /attest,
+// not trusting the caller's claim) and, if genuinely Approved, signs
+// sha256("register:" + registration_pub_key) with a DEDICATED key (not the
+// /attest key -- see loadOrGenerateRegistrationKeypair's comment for why).
+//
+// Deliberately does NOT mint or resolve a person_id here, unlike an earlier
+// draft of this design -- person-stability for identity_hash comes from the
+// Firebase UID carried on the chain's TxTypeRegisterIdentity tx (verified by
+// the relay's existing Firebase OnWrites gate, the same one every /ballots
+// POST already goes through), not from anything this enclave tracks. This
+// keeps the enclave's job exactly as narrow as /attest's: confirm a genuine
+// Didit approval and sign, nothing else.
+//
+// Self-authenticating, like /attest and unlike /register-device: a forged
+// request simply cannot produce a genuine Didit "Approved" decision, so no
+// shared secret is needed here.
+app.post("/register-browser-credential", async (req, res) => {
+  const timestamp = new Date().toISOString();
+  const caller = {
+    ip: req.get("cf-connecting-ip") || req.ip,
+    directPeerIp: req.ip,
+    host: req.get("host") || null,
+    userAgent: req.get("user-agent") || null,
+    cfRay: req.get("cf-ray") || null
+  };
+  const { session_id, registration_pub_key } = req.body || {};
+
+  try {
+    if (!session_id || !registration_pub_key) {
+      await logAttestRequest({ timestamp, caller, outcome: "register_bad_request", httpStatus: 400 });
+      return res.status(400).json({ error: "session_id and registration_pub_key are required" });
+    }
+
+    // Local replay guard (defense-in-depth; see comment above the table
+    // def). Session-scoped only -- registration is a one-time, per-device
+    // event, not a per-poll one like /attest's guard.
+    const existing = db.prepare(
+      "SELECT registration_pub_key FROM consumed_registrations WHERE session_id = ?"
+    ).get(session_id);
+    if (existing && existing.registration_pub_key !== registration_pub_key) {
+      await logAttestRequest({ timestamp, caller, session_id, outcome: "register_replay_conflict", httpStatus: 409 });
+      return res.status(409).json({ error: "session_id already consumed for a different registration_pub_key" });
+    }
+    // existing && existing.registration_pub_key === registration_pub_key:
+    // same request retried -- idempotent, falls through and re-signs below
+    // rather than erroring, same reasoning as /attest's idempotent-retry path.
+
+    // Independent live check against Didit -- not trusting the caller's claim.
+    const decision = await checkDiditSession(session_id);
+    if (decision.status !== "Approved") {
+      await logAttestRequest({
+        timestamp, caller, session_id,
+        outcome: "register_didit_not_approved", diditStatus: decision.status, httpStatus: 403
+      });
+      return res.status(403).json({ error: `Didit session status is '${decision.status}', not Approved` });
+    }
+
+    const message = Buffer.from(`register:${registration_pub_key}`, "utf8");
+    const digest = crypto.createHash("sha256").update(message).digest();
+    const signature = crypto.sign(null, digest, REGISTRATION_PRIVATE_KEY_OBJ);
+
+    if (!existing) {
+      db.prepare(
+        "INSERT INTO consumed_registrations (session_id, registration_pub_key, consumed_at) VALUES (?, ?, ?)"
+      ).run(session_id, registration_pub_key, new Date().toISOString());
+    }
+
+    await logAttestRequest({
+      timestamp, caller, session_id, registration_pub_key,
+      outcome: "registered", httpStatus: 200
+    });
+
+    res.json({
+      registration_binding_sig: signature.toString("hex"),
+      registration_pub_key,
+      session_id
+    });
+  } catch (err) {
+    console.error("register-browser-credential error:", err.message);
+    await logAttestRequest({
+      timestamp, caller, session_id: session_id || null,
+      outcome: "register_internal_error", errorMessage: err.message, httpStatus: 500
     });
     res.status(500).json({ error: "internal error" });
   }
