@@ -147,19 +147,54 @@ const POLL_PRIVATE_KEY_OBJ = crypto.createPrivateKey(POLL_PRIVATE_KEY_PEM);
 // (reject a registration tx whose didit_session_id has been seen before,
 // same pattern as the existing identity_hash uniqueness check). This local
 // table only prevents this one enclave instance from signing the same
-// session twice for two different keys -- it does not substitute for the
-// on-chain check, since an operator with instance access could in
-// principle reset it. That's an accepted, documented limitation of this
-// first build, not a claimed guarantee.
+// (session, poll) pair twice for two different keys -- it does not
+// substitute for the on-chain check, since an operator with instance access
+// could in principle reset it. That's an accepted, documented limitation of
+// this first build, not a claimed guarantee.
+//
+// Primary key is (session_id, poll_id), NOT session_id alone -- one Didit
+// verification session legitimately backs attestations for many different
+// polls over time (each poll has its own per-poll voter_pub_key, per the
+// voting-write spec), so session_id alone would let the very first real
+// attestation ever issued permanently lock out every later poll for that
+// person. Found live 2026-10-03: a single real session got "session_id
+// already consumed for a different key/poll" (409) on every bill after the
+// first successful /attest call for it, including from a diagnostic test
+// call made with throwaway values -- that diagnostic call is exactly the
+// kind of request this schema should never have let collide with a real
+// poll's attestation in the first place.
 const db = new Database(DB_PATH);
 db.exec(`
   CREATE TABLE IF NOT EXISTS consumed_sessions (
-    session_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
     voter_pub_key TEXT NOT NULL,
     poll_id TEXT NOT NULL,
-    consumed_at TEXT NOT NULL
+    consumed_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, poll_id)
   )
 `);
+// One-time migration from the old session_id-only-PK schema: if a
+// pre-existing consumed_sessions table still has the old single-column
+// primary key, rebuild it under the new composite key, preserving every
+// row (no data is lost -- each old row already had a unique session_id,
+// which remains unique paired with its own poll_id under the new schema).
+const existingSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='consumed_sessions'").get();
+if (existingSchema && existingSchema.sql && !existingSchema.sql.includes("PRIMARY KEY (session_id, poll_id)")) {
+  console.log("Migrating consumed_sessions to composite (session_id, poll_id) primary key...");
+  db.exec(`
+    ALTER TABLE consumed_sessions RENAME TO consumed_sessions_old_session_id_pk;
+    CREATE TABLE consumed_sessions (
+      session_id TEXT NOT NULL,
+      voter_pub_key TEXT NOT NULL,
+      poll_id TEXT NOT NULL,
+      consumed_at TEXT NOT NULL,
+      PRIMARY KEY (session_id, poll_id)
+    );
+    INSERT INTO consumed_sessions SELECT * FROM consumed_sessions_old_session_id_pk;
+    DROP TABLE consumed_sessions_old_session_id_pk;
+  `);
+  console.log("Migration complete.");
+}
 
 // -- Didit API key: fetched once via instance-principal auth, kept only in
 // memory, never logged, never returned by any endpoint. ---------------------
@@ -491,13 +526,18 @@ app.post("/attest", async (req, res) => {
     }
 
     // Local replay guard (defense-in-depth; see comment above the table def).
-    const existing = db.prepare("SELECT voter_pub_key, poll_id FROM consumed_sessions WHERE session_id = ?").get(session_id);
+    // Scoped to (session_id, poll_id) -- this session may already have a
+    // *different* poll's row in the table, which is fine and expected, not
+    // a conflict. Only a different key for the SAME poll is a conflict.
+    const existing = db.prepare(
+      "SELECT voter_pub_key FROM consumed_sessions WHERE session_id = ? AND poll_id = ?"
+    ).get(session_id, poll_id);
     if (existing) {
-      if (existing.voter_pub_key === voter_pub_key && existing.poll_id === poll_id) {
+      if (existing.voter_pub_key === voter_pub_key) {
         // Same request retried (e.g. client timeout+retry) -- idempotent, not an attack.
       } else {
         await logAttestRequest({ timestamp, caller, session_id, poll_id, outcome: "replay_conflict", httpStatus: 409 });
-        return res.status(409).json({ error: "session_id already consumed for a different key/poll" });
+        return res.status(409).json({ error: "session_id already consumed a different key for this poll" });
       }
     }
 
