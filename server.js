@@ -195,9 +195,21 @@ async function getObjectStorageClient() {
 
 // -- Didit verification: this service calls Didit directly, independent of
 // anything Populist's backend reports. ---------------------------------------
+//
+// Auth header: Didit's real API requires `x-api-key: <key>`, not
+// `Authorization: Bearer <key>` -- confirmed live against a real session's
+// /decision/ endpoint: Bearer gets 403 "Authentication credentials were not
+// provided or are invalid." with the exact same (valid, current) key that
+// succeeds instantly with x-api-key. This was the actual cause of every
+// /attest call 500ing with the generic {"error":"internal error"} body --
+// not a stale/rotated key (the deployed key matched the Didit dashboard's
+// current key byte-for-byte), just the wrong header name on this one call.
+// populist.js's own session-creation call (POST /v2/session/) already uses
+// x-api-key correctly, which is why verification itself worked while this
+// independent re-check never could.
 async function checkDiditSession(sessionId) {
   const res = await fetch(`https://verification.didit.me/v2/session/${encodeURIComponent(sessionId)}/decision/`, {
-    headers: { Authorization: `Bearer ${diditApiKey}` }
+    headers: { "x-api-key": diditApiKey }
   });
   if (!res.ok) {
     throw new Error(`Didit API returned ${res.status}`);
