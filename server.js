@@ -365,13 +365,28 @@ async function verifyFirebaseIdToken(idToken) {
 // to a new key as long as the poll itself is still open -- this ties the
 // window to something an operator already controls (closing the poll),
 // rather than an arbitrary timer baked into this service. Fails closed: any
-// error, a non-"open"/"pending" status, or RELAY_BASE_URL being unset all
+// error, an explicit "closed" status, or RELAY_BASE_URL being unset all
 // return false (no reassignment), matching today's permanent-lock behavior
-// rather than silently opening the window on a relay hiccup.
+// rather than silently opening the window on a relay hiccup. A 404 is the
+// one exception -- see below.
 async function isPollOpen(pollId) {
   if (!RELAY_BASE_URL) return false;
   try {
     const res = await fetch(`${RELAY_BASE_URL.replace(/\/$/, "")}/polls/${encodeURIComponent(pollId)}`);
+    if (res.status === 404) {
+      // Polls are created lazily, on a poll's first successfully-committed
+      // cast (ShywareLLC/core's ensure-poll pattern) -- a poll that has
+      // never had one yet will ALWAYS 404 here, which is the normal state
+      // for a brand-new poll's very first vote attempt, not evidence the
+      // poll is closed. Treating a 404 as "closed" made the grace window
+      // permanently unreachable for exactly the single most common case it
+      // exists to fix: a transient failure on a poll's first-ever attempt,
+      // before any ballot for it has ever landed on-chain. Found live
+      // 2026-10-04 -- a real device repeatedly hit "session_id already
+      // consumed a different key for this poll" on a poll that had simply
+      // never been created yet.
+      return true;
+    }
     if (!res.ok) return false;
     const poll = await res.json();
     return poll.status === "open" || poll.status === "pending";
