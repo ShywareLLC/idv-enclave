@@ -68,6 +68,23 @@ if (!POLL_SIGNING_SHARED_SECRET) {
   process.exit(1);
 }
 
+// Used by /register-browser-credential to independently verify a Firebase
+// ID token's signature (via Firebase's public JWKS -- no Admin SDK, no
+// service account needed) and extract the person-stable Firebase UID that
+// TxTypeRegisterIdentity's identity_hash is anchored to. Deliberately
+// verified HERE, not left to the relay's own Firebase middleware (which the
+// chain never sees past) and not verified inside the chain's ValidateTx
+// itself (a live JWKS fetch during consensus-critical validation would be
+// non-deterministic across validators -- the same reason Didit verification
+// happens here and not on-chain). The chain only ever checks this enclave's
+// own signature over (registration_pub_key + firebase_uid), which is fully
+// deterministic.
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
+if (!FIREBASE_PROJECT_ID) {
+  console.error("FIREBASE_PROJECT_ID env var is required");
+  process.exit(1);
+}
+
 // Used by /attest's replay-guard grace window (see below) to ask the relay
 // whether a poll is still open before allowing a different key to take over
 // an already-consumed (session_id, poll_id) slot. The enclave otherwise has
@@ -312,6 +329,35 @@ async function checkDiditSession(sessionId) {
     throw new Error(`Didit API returned ${res.status}`);
   }
   return res.json();
+}
+
+// -- Firebase ID token verification: same pattern as
+// ShywareLLC/sdk/adapters/auth/firebase.js's FirebaseAuthInterface (jose +
+// Firebase's public JWKS, no Admin SDK, no service account) -- ported here
+// rather than reused directly since that's a separate package/ecosystem.
+// `jose` v5 is ESM-only; server.js is CommonJS, so this uses dynamic
+// import() (works fine from CJS), not require().
+let firebaseJwks = null;
+async function getFirebaseJwks() {
+  if (firebaseJwks) return firebaseJwks;
+  const { createRemoteJWKSet } = await import("jose");
+  firebaseJwks = createRemoteJWKSet(
+    new URL("https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com")
+  );
+  return firebaseJwks;
+}
+
+async function verifyFirebaseIdToken(idToken) {
+  const { jwtVerify } = await import("jose");
+  const jwks = await getFirebaseJwks();
+  const { payload } = await jwtVerify(idToken, jwks, {
+    issuer: `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`,
+    audience: FIREBASE_PROJECT_ID
+  });
+  if (!payload.sub) {
+    throw new Error("Firebase ID token missing sub claim");
+  }
+  return payload.sub; // Firebase UID
 }
 
 // Used by /attest's replay-guard grace window: a (session_id, poll_id) slot
@@ -696,23 +742,35 @@ app.post("/attest", async (req, res) => {
 // -- Browser/device credential registration ----------------------------------
 //
 // Part of the registered-credential embodiment (one real Didit session per
-// device, instead of one per vote): given {session_id, registration_pub_key},
-// independently confirms the session with Didit's real API (same as /attest,
-// not trusting the caller's claim) and, if genuinely Approved, signs
-// sha256("register:" + registration_pub_key) with a DEDICATED key (not the
-// /attest key -- see loadOrGenerateRegistrationKeypair's comment for why).
+// device, instead of one per vote): given {session_id, registration_pub_key,
+// firebase_id_token}, independently confirms the Didit session (same as
+// /attest, not trusting the caller's claim) AND independently verifies the
+// Firebase ID token's own signature (via verifyFirebaseIdToken above --
+// Firebase's public JWKS, not the relay's say-so) to extract a person-stable
+// Firebase UID. If both check out, signs
+// sha256("register:" + registration_pub_key + ":" + firebase_uid) with a
+// DEDICATED key (not the /attest key -- see
+// loadOrGenerateRegistrationKeypair's comment for why).
 //
-// Deliberately does NOT mint or resolve a person_id here, unlike an earlier
-// draft of this design -- person-stability for identity_hash comes from the
-// Firebase UID carried on the chain's TxTypeRegisterIdentity tx (verified by
-// the relay's existing Firebase OnWrites gate, the same one every /ballots
-// POST already goes through), not from anything this enclave tracks. This
-// keeps the enclave's job exactly as narrow as /attest's: confirm a genuine
-// Didit approval and sign, nothing else.
+// Verifying the Firebase token HERE, not on-chain, is deliberate: the
+// chain's ValidateTx must be fully deterministic across every validator, and
+// a live JWKS fetch during consensus-critical validation would not be --
+// the same reason Didit verification happens here and not on-chain. Folding
+// firebase_uid into this signature means the chain only ever needs to check
+// one deterministic signature to trust both facts (genuine Didit approval
+// AND genuine Firebase identity) at once.
 //
-// Self-authenticating, like /attest and unlike /register-device: a forged
-// request simply cannot produce a genuine Didit "Approved" decision, so no
-// shared secret is needed here.
+// Does NOT mint or resolve its own person_id, unlike an earlier draft of
+// this design -- person-stability for identity_hash comes directly from the
+// Firebase UID extracted here, not from anything Didit-side (an earlier
+// draft needed Didit's cross-session face-search capability for that,
+// which turned out to be an unconfirmed dependency).
+//
+// Self-authenticating for the Didit half, like /attest and unlike
+// /register-device: a forged request simply cannot produce a genuine Didit
+// "Approved" decision. The Firebase half is self-authenticating the same
+// way: a forged request cannot produce a validly-signed Firebase ID token.
+// No shared secret is needed for either half.
 app.post("/register-browser-credential", async (req, res) => {
   const timestamp = new Date().toISOString();
   const caller = {
@@ -722,12 +780,20 @@ app.post("/register-browser-credential", async (req, res) => {
     userAgent: req.get("user-agent") || null,
     cfRay: req.get("cf-ray") || null
   };
-  const { session_id, registration_pub_key } = req.body || {};
+  const { session_id, registration_pub_key, firebase_id_token } = req.body || {};
 
   try {
-    if (!session_id || !registration_pub_key) {
+    if (!session_id || !registration_pub_key || !firebase_id_token) {
       await logAttestRequest({ timestamp, caller, outcome: "register_bad_request", httpStatus: 400 });
-      return res.status(400).json({ error: "session_id and registration_pub_key are required" });
+      return res.status(400).json({ error: "session_id, registration_pub_key, and firebase_id_token are required" });
+    }
+
+    let firebaseUid;
+    try {
+      firebaseUid = await verifyFirebaseIdToken(firebase_id_token);
+    } catch (err) {
+      await logAttestRequest({ timestamp, caller, session_id, outcome: "register_firebase_invalid", errorMessage: err.message, httpStatus: 401 });
+      return res.status(401).json({ error: "invalid or expired Firebase ID token" });
     }
 
     // Local replay guard (defense-in-depth; see comment above the table
@@ -754,7 +820,7 @@ app.post("/register-browser-credential", async (req, res) => {
       return res.status(403).json({ error: `Didit session status is '${decision.status}', not Approved` });
     }
 
-    const message = Buffer.from(`register:${registration_pub_key}`, "utf8");
+    const message = Buffer.from(`register:${registration_pub_key}:${firebaseUid}`, "utf8");
     const digest = crypto.createHash("sha256").update(message).digest();
     const signature = crypto.sign(null, digest, REGISTRATION_PRIVATE_KEY_OBJ);
 
@@ -765,13 +831,14 @@ app.post("/register-browser-credential", async (req, res) => {
     }
 
     await logAttestRequest({
-      timestamp, caller, session_id, registration_pub_key,
+      timestamp, caller, session_id, registration_pub_key, firebaseUid,
       outcome: "registered", httpStatus: 200
     });
 
     res.json({
       registration_binding_sig: signature.toString("hex"),
       registration_pub_key,
+      firebase_uid: firebaseUid,
       session_id
     });
   } catch (err) {
