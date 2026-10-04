@@ -11,7 +11,6 @@
     "better-sqlite3": "^12.4.1",
     "oci-common": "^2.109.0",
     "oci-secrets": "^2.109.0",
-    "oci-objectstorage": "^2.109.0",
-    "jose": "^5.9.6"
+    "oci-objectstorage": "^2.109.0"
   }
 }
