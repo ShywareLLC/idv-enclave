@@ -186,6 +186,46 @@ db.exec(`
     PRIMARY KEY (session_id, poll_id)
   )
 `);
+
+// Two-party-threshold recovery key store. Holds a random wrapping key `k`
+// per enrolled person, keyed by the Firebase UID carried in Didit's own
+// vendor_data (the same JSON blob -- {"userId": "..."} -- populist.js
+// already parses from webhook payloads; checkDiditSession's raw decision
+// response carries the identical field, just unread until now). `k` is
+// released only after a FRESH liveness+face-match success against the
+// person's ORIGINAL enrollment portrait (Didit's BIOMETRIC_AUTHENTICATION
+// workflow -- no document re-submission, ever, after first enrollment).
+//
+// Why this closes the single-party-correlation gap document_key opened:
+// `k` alone is useless -- it only wraps an `enc_secret` ciphertext this
+// enclave never sees, held in the relay's off-chain receipt store (a
+// DIFFERENT party). Conversely the receipt store's enc_secret is useless
+// without `k`. Neither party alone can recover person_secret or correlate
+// a person across polls -- restoring the patent's original two-party
+// threshold (composition.tex's enrollment/recovery-phase prose), using a
+// capability Didit actually, confirmedly exposes (a match decision) rather
+// than the idealized "deterministically re-derive a key from the biometric
+// template" the spec assumed before anyone checked.
+//
+// Separate table, separate replay-guard scope from consumed_sessions above
+// on purpose: enrolling for recovery and attesting a vote are independent
+// actions that must never block each other's use of the same underlying
+// Didit session.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS recovery_keys (
+    firebase_uid TEXT PRIMARY KEY,
+    k_hex TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )
+`);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS consumed_recovery_enroll_sessions (
+    session_id TEXT PRIMARY KEY,
+    firebase_uid TEXT NOT NULL,
+    consumed_at TEXT NOT NULL
+  )
+`);
+
 // One-time migration from the old session_id-only-PK schema: if a
 // pre-existing consumed_sessions table still has the old single-column
 // primary key, rebuild it under the new composite key, preserving every
@@ -386,6 +426,120 @@ app.get("/attestation", (_req, res) => {
     signature_hex: signature.toString("hex"),
     verification_status: "report_fetch_only -- AMD certificate-chain verification not yet wired up, see this endpoint's source comment"
   });
+});
+
+// Extracts {userId} from Didit's vendor_data field on a decision payload --
+// the same JSON shape populist.js already parses from webhook payloads
+// (updateUserVerificationStatusFromDidit), just read here instead of there.
+// Throws if vendor_data is missing/malformed/has no userId: both new
+// endpoints below need a real Firebase UID to key the recovery store by,
+// and a session with no vendor_data can't have one.
+function extractFirebaseUidFromVendorData(decision) {
+  if (!decision.vendor_data) {
+    throw new Error("Didit session has no vendor_data -- cannot determine which account this belongs to");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(decision.vendor_data);
+  } catch {
+    throw new Error("Didit session's vendor_data is not valid JSON");
+  }
+  if (!parsed.userId) {
+    throw new Error("Didit session's vendor_data has no userId field");
+  }
+  return String(parsed.userId);
+}
+
+// POST /recovery/enroll -- one-time (per person, idempotent on retry): given
+// a completed, Approved Didit session (the original KYC session, or any
+// other Approved session for this account), mints and returns a random
+// wrapping key `k`. Idempotent: if this person already has a stored `k`
+// (a prior successful enrollment), returns the SAME one rather than
+// minting a new one and silently orphaning whatever enc_secret the caller
+// already wrapped under the old key in the receipt store.
+//
+// This key is deliberately handed to the caller in the clear, once, right
+// now -- the caller uses it immediately to wrap person_secret into
+// enc_secret and send that to the relay's receipt store, then is expected
+// to discard `k` locally. This enclave keeps its OWN copy (that's the
+// entire point: releasing it again later, gated on a fresh biometric
+// match, is what makes recovery keyless) -- see the recovery_keys table's
+// doc comment above for the two-party-threshold reasoning.
+app.post("/recovery/enroll", async (req, res) => {
+  const { session_id } = req.body || {};
+  if (!session_id) {
+    return res.status(400).json({ error: "session_id is required" });
+  }
+  try {
+    const already = db.prepare("SELECT session_id FROM consumed_recovery_enroll_sessions WHERE session_id = ?").get(session_id);
+    if (already) {
+      return res.status(409).json({ error: "session_id already used for recovery enrollment" });
+    }
+
+    const decision = await checkDiditSession(session_id);
+    if (decision.status !== "Approved") {
+      return res.status(403).json({ error: `Didit session status is '${decision.status}', not Approved` });
+    }
+    const firebaseUid = extractFirebaseUidFromVendorData(decision);
+
+    const existing = db.prepare("SELECT k_hex FROM recovery_keys WHERE firebase_uid = ?").get(firebaseUid);
+    const kHex = existing ? existing.k_hex : crypto.randomBytes(32).toString("hex");
+    if (!existing) {
+      db.prepare("INSERT INTO recovery_keys (firebase_uid, k_hex, created_at) VALUES (?, ?, ?)")
+        .run(firebaseUid, kHex, new Date().toISOString());
+    }
+    db.prepare("INSERT INTO consumed_recovery_enroll_sessions (session_id, firebase_uid, consumed_at) VALUES (?, ?, ?)")
+      .run(session_id, firebaseUid, new Date().toISOString());
+
+    res.json({ k_hex: kHex, reused_existing_key: Boolean(existing) });
+  } catch (err) {
+    console.error("recovery/enroll error:", err.message);
+    res.status(500).json({ error: "internal error" });
+  }
+});
+
+// POST /recovery/release -- re-derives (releases) the SAME wrapping key `k`
+// an earlier /recovery/enroll call minted, gated on a FRESH liveness +
+// face-match success against this person's ORIGINAL enrollment portrait.
+// The caller supplies a Didit session_id from a workflow_type=
+// BIOMETRIC_AUTHENTICATION session -- face scan only, no document
+// resubmission, compared automatically against the portrait captured
+// during the original KYC enrollment (Didit resolves the reference image
+// itself; this enclave doesn't manage portraits at all).
+//
+// Checks sub-signals defensively, not just the top-level decision status:
+// Didit's own docs describe biometric-auth success as requiring BOTH
+// liveness_checks[] and face_matches[] entries to show "Approved" --
+// top-level status may or may not already aggregate that, so this checks
+// both explicitly rather than assuming.
+app.post("/recovery/release", async (req, res) => {
+  const { session_id } = req.body || {};
+  if (!session_id) {
+    return res.status(400).json({ error: "session_id is required" });
+  }
+  try {
+    const decision = await checkDiditSession(session_id);
+    if (decision.status !== "Approved") {
+      return res.status(403).json({ error: `Didit session status is '${decision.status}', not Approved` });
+    }
+    const livenessChecks = decision.liveness_checks || [];
+    const faceMatches = decision.face_matches || [];
+    const livenessOk = livenessChecks.length === 0 || livenessChecks.every((c) => c.status === "Approved");
+    const faceMatchOk = faceMatches.length === 0 || faceMatches.every((c) => c.status === "Approved");
+    if (!livenessOk || !faceMatchOk) {
+      return res.status(403).json({ error: "liveness or face-match check did not pass", livenessChecks, faceMatches });
+    }
+
+    const firebaseUid = extractFirebaseUidFromVendorData(decision);
+    const row = db.prepare("SELECT k_hex FROM recovery_keys WHERE firebase_uid = ?").get(firebaseUid);
+    if (!row) {
+      return res.status(404).json({ error: "no recovery key enrolled for this account -- call /recovery/enroll first" });
+    }
+    res.json({ k_hex: row.k_hex });
+  } catch (err) {
+    console.error("recovery/release error:", err.message);
+    res.status(500).json({ error: "internal error" });
+  }
 });
 
 // -- Poll-creation signing --------------------------------------------------
