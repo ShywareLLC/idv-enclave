@@ -31,6 +31,7 @@ const express = require("express");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { spawnSync } = require("child_process");
 const Database = require("better-sqlite3");
 const common = require("oci-common");
 const { SecretsClient } = require("oci-secrets");
@@ -317,6 +318,74 @@ app.get("/pubkey", (_req, res) => {
 // secret, same reasoning as /pubkey above.
 app.get("/poll-pubkey", (_req, res) => {
   res.json({ publicKeyPem: POLL_PUBLIC_KEY_PEM });
+});
+
+// GET /attestation -- the real SEV-SNP hardware report this file's own
+// header comment has been flagging as "not yet built" since this service
+// was written. Shells out to cmd/fetch-attestation (a separate Go binary --
+// fetching a report means calling SNP_GET_REPORT on /dev/sev-guest, and no
+// Node module for that exists; wraps Google's go-sev-guest client library,
+// the same one GCE's own confidential-VM tooling uses, rather than
+// hand-rolling the ioctl and AMD ABI struct layout).
+//
+// REPORT_DATA (the hardware report's 64-byte caller-bound field) is set to
+// sha256(this exact running server.js file) in its first 32 bytes -- so the
+// response cryptographically commits a specific, hardware-signed claim to a
+// specific, independently-recomputable source hash: "this code was running
+// when this attestation was issued." That's a materially different, harder-
+// to-forge claim than "trust the operator's account of what's deployed" --
+// see this file's top-of-file comment for the gap this closes (and the one
+// it doesn't, below).
+//
+// Signed with this enclave's OWN existing Ed25519 key (the same one /pubkey
+// already publishes and /attest signatures are already trusted under) --
+// so this doesn't introduce a new key for anyone to additionally trust.
+//
+// Does NOT verify the report against AMD's certificate chain before
+// returning it -- confirmed 2026-10-05 that go-sev-guest's own
+// verify.SnpAttestation fails against this specific OCI shape
+// (VM.Standard.E5.Flex) with "ECDSA verification failure"; isolated that it
+// is NOT a product-line misdetection (forcing SEV_PRODUCT_GENOA explicitly
+// made no difference), root cause not yet found. Shipping the report-fetch
+// half now, which IS confirmed working end-to-end against the real device,
+// rather than a verification step that might be silently wrong -- a broken
+// verifier that always "passes" is worse than no verifier. A relying party
+// wanting full cryptographic chain-of-trust assurance today must
+// independently verify report_b64 against AMD's KDS themselves; this
+// endpoint supplies the report, not (yet) the verification.
+app.get("/attestation", (_req, res) => {
+  const serverSource = fs.readFileSync(__filename);
+  const codeHash = crypto.createHash("sha256").update(serverSource).digest("hex");
+
+  const helperPath = path.join(__dirname, "fetch-attestation-linux");
+  const result = spawnSync(helperPath, [], { input: codeHash + "\n", encoding: "utf8" });
+  if (result.error || result.status !== 0) {
+    console.error("attestation fetch failed:", result.error || result.stderr);
+    return res.status(500).json({ error: "Failed to fetch SEV-SNP attestation report", detail: result.stderr || String(result.error) });
+  }
+
+  let report;
+  try {
+    report = JSON.parse(result.stdout);
+  } catch (err) {
+    console.error("attestation fetch returned invalid JSON:", result.stdout);
+    return res.status(500).json({ error: "Attestation helper returned invalid output" });
+  }
+
+  const signaturePayload = Buffer.from(
+    report.report_b64 + ":" + codeHash,
+    "utf8"
+  );
+  const signature = crypto.sign(null, signaturePayload, PRIVATE_KEY_OBJ);
+
+  res.json({
+    code_sha256: codeHash,
+    report_b64: report.report_b64,
+    cert_chain_b64: report.cert_chain_b64,
+    report_data_hex: report.report_data_hex,
+    signature_hex: signature.toString("hex"),
+    verification_status: "report_fetch_only -- AMD certificate-chain verification not yet wired up, see this endpoint's source comment"
+  });
 });
 
 // -- Poll-creation signing --------------------------------------------------
