@@ -16,13 +16,19 @@
 //	 "report_data_hex": "<the 64-byte REPORT_DATA field actually embedded, hex>"}
 //
 // Deliberately does NOT verify the report against AMD's certificate chain
-// here -- see README's "Attestation verification status" section for why
-// that's not wired up yet (go-sev-guest's verify.SnpAttestation fails
-// against this specific OCI shape as of 2026-10-05, cause not yet isolated:
-// confirmed NOT a product-line misdetection, since forcing
-// SEV_PRODUCT_GENOA explicitly made no difference). Shipping only the
-// report-fetch half, which IS confirmed working end-to-end against the
-// real device, rather than a verification step that might be silently
+// here -- see README's "Attestation verification status" section (now
+// written; it previously didn't exist despite this comment pointing at it)
+// for why. As of 2026-10-06: ruled out, with concrete independent checks, not
+// assumed -- KDS reachability, product-line misdetection, VLEK/VCEK
+// confusion, a go-sev-guest-specific verify bug (reproduced identically via a
+// from-scratch manual crypto/ecdsa check), and a one-off bad capture
+// (reproduced identically on a second, independent live host). Narrowed to
+// either a genuine AMD KDS bug specific to this Genoa/OCI shape (real,
+// acknowledged precedent exists -- google/go-sev-guest#103/#115 -- though not
+// confirmed as the identical symptom) or something in this host's SEV
+// firmware's report production that no method tried so far can account for.
+// Shipping only the report-fetch half, which IS confirmed working end-to-end
+// against the real device, rather than a verification step that might be silently
 // wrong. A relying party wanting full cryptographic assurance today must
 // independently verify report_b64 against AMD's KDS themselves.
 package main

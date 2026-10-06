@@ -98,6 +98,54 @@ party that this exact code, and no other, produced a given signature) — see
 the docs page for what today's guarantee actually rests on, and what's
 still open.
 
+## Attestation verification status
+
+As of 2026-10-06, `go-sev-guest`'s `verify.SnpAttestation` fails against
+reports fetched from both OCI SEV-SNP hosts this repo runs on
+(`populist-idv-enclave` and the now-terminated `zk-setup-ephemeral` ceremony
+VM — see `ShywareLLC/core/zk-ceremony-2026-10-06/README.md`), with
+`report signature verification error: x509: ECDSA verification failure`.
+
+**What's been ruled out, concretely, not assumed:**
+- Network/KDS reachability — confirmed live, both the AMD root cert chain and
+  the chip's VCEK cert fetch successfully (`200`s) directly from
+  `kdsintf.amd.com`.
+- Wrong product line — report explicitly decodes as `Genoa`; forcing
+  `SEV_PRODUCT_GENOA` in `Options` makes no difference (earlier finding,
+  reconfirmed).
+- VLEK/VCEK confusion — report's `SignerInfo` explicitly says `VCEK (0)`, not
+  VLEK; the correct VCEK (by chip ID + `ReportedTcb`, using the library's own
+  URL builder, not a hand-rolled one) is what gets fetched.
+- A bug in `go-sev-guest`'s own verify code — reproduced the exact same
+  `false` result via a fully independent manual check (`crypto/ecdsa.Verify`
+  directly against the fetched VCEK's parsed public key, SHA-384 over the
+  signed report region, R/S extracted per AMD's own byte layout) outside the
+  library entirely. Same answer both ways.
+- A one-off bad capture — reproduced identically on a second, independent,
+  currently-live host (`populist-idv-enclave`, fetched fresh), not just the
+  terminated ceremony VM's one report.
+
+**What this narrows it to:** either a genuine AMD KDS-side bug specific to
+this Genoa/OCI shape — there is real, acknowledged precedent for exactly this
+class of problem (`google/go-sev-guest` issue
+[#103](https://github.com/google/go-sev-guest/issues/103), Genoa-specific,
+closed as a duplicate of
+[#115](https://github.com/google/go-sev-guest/issues/115), where AMD
+confirmed a KDS bug directly to the library's maintainer — though #115's
+specific symptom, a stepping/productName mismatch, is not a confirmed match
+for *this* symptom, a clean VCEK fetch whose signature then fails) — or
+something in how this host's SEV firmware produces the report that neither
+`go-sev-guest` nor a from-scratch manual check can account for. Resolving
+further likely requires the same path #103 took: filing a new issue with
+`go-sev-guest`'s maintainers with the exact chip ID and TCB version, since
+they have a working escalation path directly to AMD's KDS team.
+
+**Until this closes, nothing here or in `core/zk-ceremony-2026-10-06` should
+be described as independently, cryptographically verified** — the report was
+captured and is internally self-consistent (chip ID and TCB values parse and
+resolve to a real AMD-issued cert), but its signature does not yet verify
+against that cert by any method tried.
+
 ## License
 
 TODO: pick and add a license before treating this as usable by others.
