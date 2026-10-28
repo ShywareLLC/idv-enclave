@@ -10,10 +10,9 @@
 // What this achieves: Populist's own operators cannot forge an attestation
 // for a fabricated registration, because they cannot fabricate a genuine
 // Didit "Approved" response, and this service will not sign without one.
-// What this does NOT yet achieve: full SEV-SNP attestation report
-// verification (proving to an outside party that this exact, open-source
-// code produced the signature) -- that requires the /dev/sev-guest report
-// path plus a verifier against AMD's attestation chain, not yet built.
+// Fresh SEV-SNP capture and AMD verification are implemented, but Oracle's
+// current reports fail signature verification. Even a verified hardware
+// report needs an accepted workload measurement to establish which code ran.
 // The tenancy also doesn't support the Shielded Instance (measured
 // boot/vTPM) bundle, so today's guarantee rests on: (a) SEV-SNP memory
 // encryption protecting this process's memory from the host, and (b) the
@@ -340,8 +339,10 @@ async function isPollOpen(pollId) {
   }
 }
 
+const PUBLICATION_ADMISSION_SECRET = process.env.PUBLICATION_ADMISSION_SECRET;
+
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 app.get("/health", (_req, res) => {
   res.json({ status: "healthy", hasKey: Boolean(diditApiKey) });
@@ -360,72 +361,38 @@ app.get("/poll-pubkey", (_req, res) => {
   res.json({ publicKeyPem: POLL_PUBLIC_KEY_PEM });
 });
 
-// GET /attestation -- the real SEV-SNP hardware report this file's own
-// header comment has been flagging as "not yet built" since this service
-// was written. Shells out to cmd/fetch-attestation (a separate Go binary --
-// fetching a report means calling SNP_GET_REPORT on /dev/sev-guest, and no
-// Node module for that exists; wraps Google's go-sev-guest client library,
-// the same one GCE's own confidential-VM tooling uses, rather than
-// hand-rolling the ioctl and AMD ABI struct layout).
-//
-// REPORT_DATA (the hardware report's 64-byte caller-bound field) is set to
-// sha256(this exact running server.js file) in its first 32 bytes -- so the
-// response cryptographically commits a specific, hardware-signed claim to a
-// specific, independently-recomputable source hash: "this code was running
-// when this attestation was issued." That's a materially different, harder-
-// to-forge claim than "trust the operator's account of what's deployed" --
-// see this file's top-of-file comment for the gap this closes (and the one
-// it doesn't, below).
-//
-// Signed with this enclave's OWN existing Ed25519 key (the same one /pubkey
-// already publishes and /attest signatures are already trusted under) --
-// so this doesn't introduce a new key for anyone to additionally trust.
-//
-// Does NOT verify the report against AMD's certificate chain before
-// returning it -- confirmed 2026-10-05 that go-sev-guest's own
-// verify.SnpAttestation fails against this specific OCI shape
-// (VM.Standard.E5.Flex) with "ECDSA verification failure"; isolated that it
-// is NOT a product-line misdetection (forcing SEV_PRODUCT_GENOA explicitly
-// made no difference), root cause not yet found. Shipping the report-fetch
-// half now, which IS confirmed working end-to-end against the real device,
-// rather than a verification step that might be silently wrong -- a broken
-// verifier that always "passes" is worse than no verifier. A relying party
-// wanting full cryptographic chain-of-trust assurance today must
-// independently verify report_b64 against AMD's KDS themselves; this
-// endpoint supplies the report, not (yet) the verification.
-app.get("/attestation", (_req, res) => {
-  const serverSource = fs.readFileSync(__filename);
-  const codeHash = crypto.createHash("sha256").update(serverSource).digest("hex");
-
-  const helperPath = path.join(__dirname, "fetch-attestation-linux");
-  const result = spawnSync(helperPath, [], { input: codeHash + "\n", encoding: "utf8" });
-  if (result.error || result.status !== 0) {
-    console.error("attestation fetch failed:", result.error || result.stderr);
-    return res.status(500).json({ error: "Failed to fetch SEV-SNP attestation report", detail: result.stderr || String(result.error) });
+// The verifier supplies a fresh challenge. REPORT_DATA binds that challenge,
+// the service signing key and source digest; it is not a measured-boot proof
+// that Node executed only this file.
+app.get("/attestation", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  const challenge = req.query.challenge;
+  if (typeof challenge !== "string" || !/^[0-9a-f]{64}$/.test(challenge)) {
+    return res.status(400).json({ error: "Supply a fresh 32-byte lowercase hex challenge" });
   }
-
-  let report;
-  try {
-    report = JSON.parse(result.stdout);
-  } catch (err) {
-    console.error("attestation fetch returned invalid JSON:", result.stdout);
-    return res.status(500).json({ error: "Attestation helper returned invalid output" });
-  }
-
-  const signaturePayload = Buffer.from(
-    report.report_b64 + ":" + codeHash,
-    "utf8"
-  );
-  const signature = crypto.sign(null, signaturePayload, PRIVATE_KEY_OBJ);
-
-  res.json({
-    code_sha256: codeHash,
-    report_b64: report.report_b64,
-    cert_chain_b64: report.cert_chain_b64,
-    report_data_hex: report.report_data_hex,
-    signature_hex: signature.toString("hex"),
-    verification_status: "report_fetch_only -- AMD certificate-chain verification not yet wired up, see this endpoint's source comment"
+  const codeHash = crypto.createHash("sha256").update(fs.readFileSync(__filename)).digest("hex");
+  const keyBinding = crypto.createHash("sha256")
+    .update("shyware-enrollment-attestation-v1\0")
+    .update(Buffer.from(PUBLIC_KEY_HEX, "hex"))
+    .update(Buffer.from(challenge, "hex")).digest("hex");
+  const expectedReportData = codeHash + keyBinding;
+  const result = spawnSync(path.join(__dirname, "fetch-attestation-linux"), [], {
+    input: expectedReportData + "\n", encoding: "utf8", timeout: 30000, maxBuffer: 1024 * 1024
   });
+  if (result.error || result.status !== 0) {
+    return res.status(503).json({ error: "Hardware report capture unavailable" });
+  }
+  let report;
+  try { report = JSON.parse(result.stdout); }
+  catch { return res.status(503).json({ error: "Invalid hardware report output" }); }
+  const evidence = {
+    contract: "shyware-enrollment-attestation-v1", challenge,
+    public_key_hex: PUBLIC_KEY_HEX, code_sha256: codeHash,
+    report_b64: report.report_b64, cert_chain_b64: report.cert_chain_b64,
+    report_data_hex: report.report_data_hex, verification: report.verification,
+    workload_measurement_verified: false
+  };
+  res.json({ ...evidence, signature_hex: crypto.sign(null, Buffer.from(JSON.stringify(evidence)), PRIVATE_KEY_OBJ).toString("hex") });
 });
 
 // Extracts {userId} from Didit's vendor_data field on a decision payload --
@@ -772,6 +739,78 @@ async function logAttestRequest(record) {
   }
 }
 
+function documentIdentityHash(decision, pollId) {
+  const idv = decision.id_verification || {};
+  if (!idv.document_number) throw new Error("Verified document identity is unavailable");
+  const documentKey = `${idv.document_type || ""}:${idv.issuing_state || idv.country || ""}:${idv.document_number}`;
+  return crypto.createHash("sha256").update(Buffer.from(documentKey + pollId, "utf8")).digest("hex");
+}
+
+app.post("/voter-reveal/identity", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  const auth = req.get("authorization") || "";
+  if (!timingSafeEqual(auth.startsWith("Bearer ") ? auth.slice(7) : "", POLL_SIGNING_SHARED_SECRET)) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const { session_id, poll_id, user_id } = req.body || {};
+  if (typeof session_id !== "string" || !session_id || typeof poll_id !== "string" || !poll_id || typeof user_id !== "string" || !user_id) {
+    return res.status(400).json({ error: "session_id, poll_id and user_id are required" });
+  }
+  try {
+    const decision = await checkDiditSession(session_id);
+    if (decision.status !== "Approved" || extractFirebaseUidFromVendorData(decision) !== user_id) {
+      return res.status(403).json({ error: "Identity verification failed" });
+    }
+    // Read-only: no enrollment signature, session consumption or device-key change.
+    return res.json({ identity_hash: documentIdentityHash(decision, poll_id) });
+  } catch {
+    return res.status(503).json({ error: "Identity verification unavailable" });
+  }
+});
+
+// Paired envelopes are checked here privately; only independently sorted lists
+// and the admission authority signature are returned for ledger publication.
+const reconciliationPublicKey = process.env.RECONCILIATION_PUBLIC_KEY_HEX ? crypto.createPublicKey({key:Buffer.concat([Buffer.from("302a300506032b6570032100","hex"),Buffer.from(process.env.RECONCILIATION_PUBLIC_KEY_HEX,"hex")]),type:"spki",format:"der"}) : null;
+require('./voteRecovery.cjs').installVoteRecovery({app, db,
+ authorize: req => Boolean(PUBLICATION_ADMISSION_SECRET) && timingSafeEqual((req.get('authorization') || '').replace(/^Bearer /,''), PUBLICATION_ADMISSION_SECRET),
+ checkDiditSession, documentIdentityHash, extractFirebaseUidFromVendorData, getObjectStorageClient,
+ namespace: AUDIT_LOG_NAMESPACE, bucket: AUDIT_LOG_BUCKET, relayBaseURL: RELAY_BASE_URL,
+ getApiKey: () => diditApiKey, privateKey: PRIVATE_KEY_OBJ, workflowID: process.env.RECOVERY_BIOMETRIC_WORKFLOW_ID,
+});
+
+app.post("/publication/admit", async (req, res) => {
+  const auth = req.get("authorization") || "";
+  if (!PUBLICATION_ADMISSION_SECRET || !timingSafeEqual(auth.startsWith("Bearer ") ? auth.slice(7) : "", PUBLICATION_ADMISSION_SECRET)) return res.status(401).json({ error: "unauthorized" });
+  const { poll_id, submissions } = req.body || {};
+  if (typeof poll_id !== "string" || !poll_id || !Array.isArray(submissions) || !RELAY_BASE_URL) return res.status(400).json({ error: "Invalid admission request" });
+  try {
+    const base = RELAY_BASE_URL.replace(/\/$/, "");
+    const [snapshotResponse, beaconResponse] = await Promise.all([
+      fetch(base + "/polls/" + encodeURIComponent(poll_id) + "/inspection", { signal: AbortSignal.timeout(10000) }),
+      fetch(base + "/beacons", { signal: AbortSignal.timeout(10000) })
+    ]);
+    if (!snapshotResponse.ok || !beaconResponse.ok) return res.status(503).json({ error: "Ledger snapshot unavailable" });
+    const snapshot = await snapshotResponse.json();
+    const records = JSON.parse(snapshot.records);
+    if (records.poll?.poll_id !== poll_id) return res.status(403).json({ error: "Poll scope mismatch" });
+    for (const [index, envelope] of submissions.entries()) {
+      if (envelope.type !== 2) continue;
+      const decision = await checkDiditSession(envelope.data?.didit_session_id);
+      if (decision.status !== "Approved" || documentIdentityHash(decision, poll_id) !== envelope.data.identity_hash) return res.status(403).json({ error: "Enrollment verification failed", submission_index: index });
+    }
+    const { buildSeparatedRelease, signSeparatedRelease } = require("./separatedPublication.cjs");
+    const release = buildSeparatedRelease(snapshot, submissions, crypto.createPublicKey(PUBLIC_KEY_PEM), await beaconResponse.json(), Math.floor(Date.now()/1000), reconciliationPublicKey, db.prepare("SELECT identity_hash,voter_pub_key,owner_hash FROM recovered_vote_devices WHERE poll_id=?").all(poll_id));
+    return res.json(signSeparatedRelease(release, PRIVATE_KEY_OBJ));
+  } catch (error) {
+    if (Number.isInteger(error.submissionIndex)) {
+      const code = require("./separatedPublication.cjs").admissionFailureCode(error);
+      console.warn("Publication admission rejected: " + code);
+      return res.status(403).json({ error: "Publication admission rejected", reason: code, submission_index: error.submissionIndex });
+    }
+    return res.status(503).json({ error: "Publication admission unavailable" });
+  }
+});
+
 app.post("/attest", async (req, res) => {
   const timestamp = new Date().toISOString();
   // When fronted by Cloudflare, req.ip is Cloudflare's own edge IP, not the
@@ -795,36 +834,9 @@ app.post("/attest", async (req, res) => {
       return res.status(400).json({ error: "session_id, voter_pub_key, and poll_id are required" });
     }
 
-    // Local replay guard (defense-in-depth; see comment above the table def).
-    // Scoped to (session_id, poll_id) -- this session may already have a
-    // *different* poll's row in the table, which is fine and expected, not
-    // a conflict. Only a different key for the SAME poll is a conflict --
-    // unless the poll is still open, in which case the grace window below
-    // lets the new key take over (a transient failure after the first
-    // signature shouldn't permanently orphan the poll for this session).
-    let reassigned = false;
-    const existing = db.prepare(
-      "SELECT voter_pub_key FROM consumed_sessions WHERE session_id = ? AND poll_id = ?"
-    ).get(session_id, poll_id);
-    if (existing) {
-      if (existing.voter_pub_key === voter_pub_key) {
-        // Same request retried (e.g. client timeout+retry) -- idempotent, not an attack.
-      } else if (await isPollOpen(poll_id)) {
-        // Grace window: poll hasn't closed yet, so a different key may
-        // reassign this slot. Does not touch consumedSessions on-chain
-        // (ballots.go) -- that's the actual, authoritative one-session-ever
-        // enforcement and is unaffected either way; this only ever matters
-        // pre-commit.
-        db.prepare(
-          "UPDATE consumed_sessions SET voter_pub_key = ? WHERE session_id = ? AND poll_id = ?"
-        ).run(voter_pub_key, session_id, poll_id);
-        reassigned = true;
-        await logAttestRequest({ timestamp, caller, session_id, poll_id, outcome: "replay_grace_reassigned", httpStatus: 200 });
-      } else {
-        await logAttestRequest({ timestamp, caller, session_id, poll_id, outcome: "replay_conflict", httpStatus: 409 });
-        return res.status(409).json({ error: "session_id already consumed a different key for this poll" });
-      }
-    }
+    // Keep the first enrollment key; additional device keys are recorded
+    // separately after identity verification rather than replacing it.
+    const existing = db.prepare("SELECT voter_pub_key FROM consumed_sessions WHERE session_id = ? AND poll_id = ?").get(session_id, poll_id);
 
     // Independent live check against Didit -- not trusting the caller's claim.
     const decision = await checkDiditSession(session_id);
@@ -857,8 +869,8 @@ app.post("/attest", async (req, res) => {
       });
       return res.status(403).json({ error: "Didit session has no id_verification.document_number to anchor identity_hash to" });
     }
-    const documentKey = `${idv.document_type || ""}:${idv.issuing_state || idv.country || ""}:${idv.document_number}`;
-    const identityHash = crypto.createHash("sha256").update(Buffer.from(documentKey + poll_id, "utf8")).digest("hex");
+    const identityHash = documentIdentityHash(decision, poll_id);
+    db.prepare("INSERT OR IGNORE INTO authorized_vote_devices(poll_id,identity_hash,voter_pub_key) VALUES (?,?,?)").run(poll_id,identityHash,voter_pub_key);
 
     // Must exactly match the Go core's diditDeviceAttestMessage:
     // sha256(voter_pub_key || poll_id || identity_hash) -- raw ASCII bytes
@@ -891,7 +903,6 @@ app.post("/attest", async (req, res) => {
       voter_pub_key,
       poll_id,
       session_id,
-      ...(reassigned ? { replay_grace_reassigned: true } : {})
     });
   } catch (err) {
     console.error("attest error:", err.message);
