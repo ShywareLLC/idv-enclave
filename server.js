@@ -969,6 +969,20 @@ app.post("/audit-log", async (req, res) => {
 const PORT = process.env.PORT || 8443;
 const TLS_KEY = process.env.TLS_KEY_PATH;
 const TLS_CERT = process.env.TLS_CERT_PATH;
+// More certificates, chosen by the hostname the client asks for (SNI): the
+// service is reached under more than one domain (attest.thumbprint.us, and
+// attest.youinpolitics.com while older app builds use it), each Cloudflare
+// zone with its own origin certificate. Format:
+//   TLS_SNI_CERTS="thumbprint.us,*.thumbprint.us=/path/key.pem:/path/cert.pem;other=..."
+// Hostnames no entry names get TLS_KEY_PATH/TLS_CERT_PATH.
+function sniContexts(spec) {
+  return String(spec || "").split(";").map((entry) => entry.trim()).filter(Boolean).map((entry) => {
+    const [hosts, paths] = entry.split("=");
+    const [key, cert] = String(paths || "").split(":");
+    if (!hosts || !key || !cert) throw new Error(`TLS_SNI_CERTS entry "${entry}" is not hosts=key:cert`);
+    return { hosts: hosts.split(",").map((h) => h.trim()).filter(Boolean), key, cert };
+  });
+}
 
 async function start() {
   diditApiKey = await fetchDiditApiKey();
@@ -976,9 +990,13 @@ async function start() {
 
   if (TLS_KEY && TLS_CERT && fs.existsSync(TLS_KEY) && fs.existsSync(TLS_CERT)) {
     const https = require("https");
-    https
-      .createServer({ key: fs.readFileSync(TLS_KEY), cert: fs.readFileSync(TLS_CERT) }, app)
-      .listen(PORT, () => console.log(`populist-idv-enclave listening on https://0.0.0.0:${PORT}`));
+    const server = https.createServer({ key: fs.readFileSync(TLS_KEY), cert: fs.readFileSync(TLS_CERT) }, app);
+    for (const context of sniContexts(process.env.TLS_SNI_CERTS)) {
+      const credentials = { key: fs.readFileSync(context.key), cert: fs.readFileSync(context.cert) };
+      for (const host of context.hosts) server.addContext(host, credentials);
+      console.log(`TLS certificate for ${context.hosts.join(", ")} (by SNI)`);
+    }
+    server.listen(PORT, () => console.log(`populist-idv-enclave listening on https://0.0.0.0:${PORT}`));
   } else {
     app.listen(PORT, () => console.log(`populist-idv-enclave listening on http://0.0.0.0:${PORT} (NO TLS -- set TLS_KEY_PATH/TLS_CERT_PATH)`));
   }
