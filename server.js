@@ -768,23 +768,20 @@ app.post("/voter-reveal/identity", async (req, res) => {
   }
 });
 
-// POST /vote-share/grant -- verifies the granter (only), then signs an
-// ongoing vote-share grant naming the grantee's account. See voteShareGrants.cjs.
-require("./voteShareGrants.cjs").installVoteShareGrantRoute(app, {
+// POST /vote-share/attest-key -- like /attest: the device calls it directly,
+// the enclave re-checks Didit and vouches for the device's key; the device
+// then signs each vote-share grant itself. See voteShareGrants.cjs.
+require("./voteShareGrants.cjs").installVoteShareKeyRoute(app, {
   privateKey: PRIVATE_KEY_OBJ,
   checkDiditSession,
   firebaseUidOf: extractFirebaseUidFromVendorData,
-  authorized: (req) => {
-    const auth = req.get("authorization") || "";
-    return timingSafeEqual(auth.startsWith("Bearer ") ? auth.slice(7) : "", POLL_SIGNING_SHARED_SECRET);
-  },
-  async logGrant(record) {
+  async log(record) {
     try {
       const client = await getObjectStorageClient();
       await client.putObject({
         namespaceName: AUDIT_LOG_NAMESPACE,
         bucketName: AUDIT_LOG_BUCKET,
-        objectName: `vote-share-grants/${record.timestamp}-${record.grant_id}.json`,
+        objectName: `vote-share-keys/${record.timestamp}-${crypto.randomUUID()}.json`,
         putObjectBody: Buffer.from(JSON.stringify(record)),
         contentType: "application/json"
       });

@@ -1,87 +1,64 @@
-// Vote-share grants: the enclave's half of letting a verified voter give
-// another account ongoing access to their votes, the same shape as the PHI
-// "ongoing provider disclosure" consent.
+// Vote-share grants, the voting way: the enclave vouches for the granter's
+// DEVICE KEY, and the device signs every grant itself.
 //
-// Only the granter is verified, and only here, once: the caller presents the
-// granter's Didit session, the enclave re-checks it with Didit itself and that
-// it is bound to the granter's Firebase account, then signs the grant with the
-// enclave's Ed25519 key. The grantee is just a named Firebase account. Access
-// is checked later by the reconciling authority against this signature, the
-// grantee's own sign-in and its own withdrawal list; the enclave is never in
-// the access path, so it never learns when a grant is used.
+// Same split as POST /attest for ballots. The device generates its own
+// Ed25519 key (it never leaves the device) and calls this endpoint directly
+// with its Didit session. The enclave re-checks Didit itself, confirms the
+// session is bound to the claimed Firebase account, and signs a statement
+// binding that public key to that account. The device then signs each grant
+// (grantee, scope, time) with its private key; the reconciling authority
+// checks both signatures, on storing the grant and on every access. Nobody
+// without the device key can produce a grant: not Populist's server, not this
+// enclave. Only the granter is verified; the grantee is only named, and the
+// enclave is never in the access path.
 
 const crypto = require("node:crypto");
 
-const GRANT_VERSION = 1;
-const SCOPES = new Set(["all_votes"]);
 const UID = /^[A-Za-z0-9:_-]{1,128}$/;
+const PUB_HEX = /^[0-9a-f]{64}$/;
 
-/// The exact bytes that are signed: fixed key order, no whitespace.
-function grantMessage(grant) {
-  return JSON.stringify({
-    v: grant.v, grant_id: grant.grant_id, purpose: grant.purpose, scope: grant.scope,
-    grantor_uid: grant.grantor_uid, grantee_uid: grant.grantee_uid, issued_at: grant.issued_at
-  });
+/// The bytes the enclave signs: newline-joined fields (identical in every language).
+function keyAttestationMessage(userId, pubKeyHex) {
+  return ["shyware-vote-share-key-v1", userId, pubKeyHex].join("\n");
 }
 
-function validateRequest({ grantor_uid, grantee_uid, scope = "all_votes" } = {}) {
-  if (typeof grantor_uid !== "string" || !UID.test(grantor_uid)) return "grantor_uid is invalid";
-  if (typeof grantee_uid !== "string" || !UID.test(grantee_uid)) return "grantee_uid is invalid";
-  if (grantor_uid === grantee_uid) return "a grant must name another account";
-  if (!SCOPES.has(scope)) return "scope is not supported";
-  return null;
-}
-
-/// Builds and signs a grant. `privateKey` is the enclave's Ed25519 KeyObject.
-function issueGrant(privateKey, { grantor_uid, grantee_uid, scope = "all_votes" }, now = new Date()) {
-  const grant = {
-    v: GRANT_VERSION, grant_id: crypto.randomUUID(), purpose: "vote_share", scope,
-    grantor_uid, grantee_uid, issued_at: now.toISOString()
-  };
-  const signature = crypto.sign(null, Buffer.from(grantMessage(grant)), privateKey).toString("hex");
-  return { grant, signature };
-}
-
-/// Verifies a grant against the enclave's public key (raw 32-byte hex).
-function verifyGrant(publicKeyHex, grant, signatureHex) {
+function verifyEd25519(publicKeyHex, message, signatureHex) {
   try {
     const der = Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(publicKeyHex, "hex")]);
     const key = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
-    return crypto.verify(null, Buffer.from(grantMessage(grant)), key, Buffer.from(signatureHex, "hex"));
+    return crypto.verify(null, Buffer.from(message, "utf8"), key, Buffer.from(signatureHex, "hex"));
   } catch {
     return false;
   }
 }
 
-/// The route: granter-only verification, then a signed grant.
-/// `checkDiditSession(sessionId)` and `firebaseUidOf(decision)` are the
-/// enclave's existing Didit helpers; `authorized(req)` checks the caller.
-function installVoteShareGrantRoute(app, { privateKey, checkDiditSession, firebaseUidOf, authorized, logGrant = async () => {} }) {
-  app.post("/vote-share/grant", async (req, res) => {
+/// POST /vote-share/attest-key {session_id, user_id, pub_key}: called by the
+/// device itself, like /attest. `checkDiditSession` and `firebaseUidOf` are
+/// the enclave's existing Didit helpers.
+function installVoteShareKeyRoute(app, { privateKey, checkDiditSession, firebaseUidOf, log = async () => {} }) {
+  app.post("/vote-share/attest-key", async (req, res) => {
     res.set("Cache-Control", "no-store");
-    if (!authorized(req)) return res.status(401).json({ error: "unauthorized" });
-    const body = req.body || {};
-    const invalid = validateRequest(body);
-    if (invalid || typeof body.session_id !== "string" || !body.session_id) {
-      return res.status(400).json({ error: invalid || "session_id is required" });
+    const { session_id, user_id, pub_key } = req.body || {};
+    if (typeof session_id !== "string" || !session_id || typeof user_id !== "string" || !UID.test(user_id)
+        || typeof pub_key !== "string" || !PUB_HEX.test(pub_key)) {
+      return res.status(400).json({ error: "session_id, user_id and pub_key (32-byte hex) are required" });
     }
     let decision;
     try {
-      decision = await checkDiditSession(body.session_id);
+      decision = await checkDiditSession(session_id);
     } catch {
       return res.status(503).json({ error: "Identity verification unavailable" });
     }
     let boundUid = null;
     try { boundUid = firebaseUidOf(decision); } catch { boundUid = null; }
-    if (decision?.status !== "Approved" || boundUid !== body.grantor_uid) {
-      return res.status(403).json({ error: "The granter's identity verification failed" });
+    if (decision?.status !== "Approved" || boundUid !== user_id) {
+      await log({ timestamp: new Date().toISOString(), user_id, outcome: "verification_failed" });
+      return res.status(403).json({ error: "Identity verification failed" });
     }
-    const issued = issueGrant(privateKey, { grantor_uid: body.grantor_uid, grantee_uid: body.grantee_uid, scope: body.scope || "all_votes" });
-    // Who shares with whom is recorded; how anyone voted never reaches here.
-    await logGrant({ timestamp: issued.grant.issued_at, grant_id: issued.grant.grant_id,
-      grantor_uid: issued.grant.grantor_uid, grantee_uid: issued.grant.grantee_uid, scope: issued.grant.scope });
-    return res.json(issued);
+    const signature = crypto.sign(null, Buffer.from(keyAttestationMessage(user_id, pub_key), "utf8"), privateKey).toString("hex");
+    await log({ timestamp: new Date().toISOString(), user_id, pub_key, outcome: "signed" });
+    return res.json({ user_id, pub_key, key_attestation_sig: signature });
   });
 }
 
-module.exports = { GRANT_VERSION, grantMessage, validateRequest, issueGrant, verifyGrant, installVoteShareGrantRoute };
+module.exports = { keyAttestationMessage, verifyEd25519, installVoteShareKeyRoute };
