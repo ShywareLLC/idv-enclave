@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const Database = require("better-sqlite3");
-const { keyAttestationMessage, keyRequestMessage, verifyEd25519, hmacHex, installVoteShareRoutes } = require("./voteShareGrants.cjs");
+const { keyAttestationMessage, keyRequestMessage, ballotKeyRequestMessage, verifyEd25519, hmacHex, installVoteShareRoutes } = require("./voteShareGrants.cjs");
 
 const enclave = crypto.generateKeyPairSync("ed25519");
 const enclavePub = enclave.publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("hex");
@@ -15,9 +15,12 @@ function setup() {
   installVoteShareRoutes(app, {
     db: new Database(":memory:"),
     privateKey: enclave.privateKey,
-    checkDiditSession: async (id) => ({ status: id.startsWith("declined") ? "Declined" : "Approved", uid: "alice" }),
+    checkDiditSession: async (id) => ({ status: id.startsWith("declined") ? "Declined" : "Approved", uid: "alice",
+      id_verification: { document_type: "P", country: "USA", document_number: "X123" } }),
     firebaseUidOf: (d) => d.uid,
-    log: async (r) => logged.push(r)
+    documentKeyOf: (d) => `${d.id_verification.document_type}:${d.id_verification.country}:${d.id_verification.document_number}`,
+    log: async (r) => logged.push(r),
+    logAttest: async (r) => logged.push(r)
   });
   const call = async (p, body) => {
     let status = 200, payload;
@@ -55,4 +58,25 @@ test("only the enrolled device's secret gets its key vouched for", async () => {
   const stale = new Date(Date.now() - 3600e3).toISOString();
   assert.equal((await call("/vote-share/attest-key", keyRequest(enrolled, { timestamp: stale }))).status, 400, "replayed request");
   assert.ok(logged.every((r) => !("session_id" in r) && !("secret_hex" in r)), "neither the session nor the secret is logged");
+});
+
+test("ballot keys need the enrolled device and its identity key, never a session id", async () => {
+  const { call, logged } = setup();
+  const enrolled = (await call("/device-secret/enroll", { session_id: "s1", user_id: "alice" })).body;
+  assert.match(enrolled.identity_key_hex, /^[0-9a-f]{64}$/);
+  const ballot = ({ secret = enrolled.secret_hex, identityKey = enrolled.identity_key_hex, poll = "poll-1" } = {}) => {
+    const timestamp = new Date().toISOString();
+    return { user_id: "alice", device_id: enrolled.device_id, voter_pub_key: devicePub, poll_id: poll, timestamp, identity_key: identityKey,
+      mac: hmacHex(secret, ballotKeyRequestMessage("alice", enrolled.device_id, devicePub, poll, timestamp)) };
+  };
+  const ok = await call("/attest", ballot());
+  assert.equal(ok.status, 200);
+  const expected = crypto.createHash("sha256").update("P:USA:X123poll-1").digest("hex");
+  assert.equal(ok.body.identity_hash, expected, "the same identity_hash as the session-based attest computed");
+  const digest = crypto.createHash("sha256").update(devicePub + "poll-1" + expected).digest();
+  assert.equal(crypto.verify(null, digest, enclave.publicKey, Buffer.from(ok.body.idv_attestation_sig, "hex")), true, "what the chain verifies");
+  assert.equal((await call("/attest", { session_id: "s1", voter_pub_key: devicePub, poll_id: "poll-1" })).status, 400, "a session id alone");
+  assert.equal((await call("/attest", ballot({ secret: "22".repeat(32) }))).status, 403, "without the device secret");
+  assert.equal((await call("/attest", ballot({ identityKey: "33".repeat(32) }))).status, 403, "without the identity key");
+  assert.ok(!JSON.stringify(logged).includes("X123"), "the document number is never logged");
 });

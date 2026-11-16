@@ -777,6 +777,12 @@ app.post("/voter-reveal/identity", async (req, res) => {
 require("./voteShareGrants.cjs").installVoteShareRoutes(app, {
   db,
   privateKey: PRIVATE_KEY_OBJ,
+  documentKeyOf(decision) {
+    const idv = decision.id_verification || {};
+    if (!idv.document_number) return null;
+    return `${idv.document_type || ""}:${idv.issuing_state || idv.country || ""}:${idv.document_number}`;
+  },
+  logAttest: (record) => logAttestRequest(record),
   checkDiditSession,
   firebaseUidOf: extractFirebaseUidFromVendorData,
   async log(record) {
@@ -881,11 +887,10 @@ app.post("/publication/admit", async (req, res) => {
     const snapshot = await snapshotResponse.json();
     const records = JSON.parse(snapshot.records);
     if (records.poll?.poll_id !== poll_id) return res.status(403).json({ error: "Poll scope mismatch" });
-    for (const [index, envelope] of submissions.entries()) {
-      if (envelope.type !== 2) continue;
-      const decision = await checkDiditSession(envelope.data?.didit_session_id);
-      if (decision.status !== "Approved" || documentIdentityHash(decision, poll_id) !== envelope.data.identity_hash) return res.status(403).json({ error: "Enrollment verification failed", submission_index: index });
-    }
+    // Each enrollment's idv_attestation_sig (this enclave's own signature over
+    // voter_pub_key || poll_id || identity_hash) is verified in
+    // buildSeparatedRelease; Didit is not re-asked by session id, which no
+    // longer travels with ballots.
     const { buildSeparatedRelease, signSeparatedRelease } = require("./separatedPublication.cjs");
     const release = buildSeparatedRelease(snapshot, submissions, crypto.createPublicKey(PUBLIC_KEY_PEM), await beaconResponse.json(), Math.floor(Date.now()/1000), reconciliationPublicKey, db.prepare("SELECT identity_hash,voter_pub_key,owner_hash FROM recovered_vote_devices WHERE poll_id=?").all(poll_id));
     return res.json(signSeparatedRelease(release, PRIVATE_KEY_OBJ));
@@ -899,109 +904,8 @@ app.post("/publication/admit", async (req, res) => {
   }
 });
 
-app.post("/attest", async (req, res) => {
-  const timestamp = new Date().toISOString();
-  // When fronted by Cloudflare, req.ip is Cloudflare's own edge IP, not the
-  // real caller -- CF-Connecting-IP carries the actual client address.
-  // cfRay is Cloudflare's own per-request trace ID, recorded here purely
-  // for cross-referencing against Cloudflare's edge logs/analytics if
-  // ever needed -- not treated as a trust source, just a correlation key.
-  const caller = {
-    ip: req.get("cf-connecting-ip") || req.ip,
-    directPeerIp: req.ip,
-    host: req.get("host") || null,
-    referer: req.get("referer") || null,
-    userAgent: req.get("user-agent") || null,
-    cfRay: req.get("cf-ray") || null
-  };
-  const { session_id, voter_pub_key, poll_id } = req.body || {};
-
-  try {
-    if (!session_id || !voter_pub_key || !poll_id) {
-      await logAttestRequest({ timestamp, caller, outcome: "bad_request", httpStatus: 400 });
-      return res.status(400).json({ error: "session_id, voter_pub_key, and poll_id are required" });
-    }
-
-    // Keep the first enrollment key; additional device keys are recorded
-    // separately after identity verification rather than replacing it.
-    const existing = db.prepare("SELECT voter_pub_key FROM consumed_sessions WHERE session_id = ? AND poll_id = ?").get(session_id, poll_id);
-
-    // Independent live check against Didit -- not trusting the caller's claim.
-    const decision = await checkDiditSession(session_id);
-    if (decision.status !== "Approved") {
-      await logAttestRequest({
-        timestamp, caller, session_id, poll_id,
-        outcome: "didit_not_approved", diditStatus: decision.status, httpStatus: 403
-      });
-      return res.status(403).json({ error: `Didit session status is '${decision.status}', not Approved` });
-    }
-
-    // identity_hash anchor: Didit's real API has no "person_id"/"personId"
-    // field anywhere in the decision payload (confirmed directly against a
-    // live session -- see the comment in ShywareVotingService.swift's
-    // ensureInitialized, and populist.js's own existing use of this same
-    // field for a different purpose, address-prefill-on-returning-device).
-    // The closest real stable-across-sessions signal Didit's id_verification
-    // actually provides is the government ID document itself:
-    // document_type + issuing country/number together identify the same
-    // real document being re-verified in a later, completely independent
-    // session -- this is WHY this runs inside a confidential-computing
-    // enclave rather than an ordinary service: document_number is real PII,
-    // and it must never leave this process in raw form. Only the resulting
-    // one-way hash (identityHash below) ever leaves.
-    const idv = decision.id_verification || {};
-    if (!idv.document_number) {
-      await logAttestRequest({
-        timestamp, caller, session_id, poll_id,
-        outcome: "no_id_verification_document", httpStatus: 403
-      });
-      return res.status(403).json({ error: "Didit session has no id_verification.document_number to anchor identity_hash to" });
-    }
-    const identityHash = documentIdentityHash(decision, poll_id);
-    db.prepare("INSERT OR IGNORE INTO authorized_vote_devices(poll_id,identity_hash,voter_pub_key) VALUES (?,?,?)").run(poll_id,identityHash,voter_pub_key);
-
-    // Must exactly match the Go core's diditDeviceAttestMessage:
-    // sha256(voter_pub_key || poll_id || identity_hash) -- raw ASCII bytes
-    // concatenated directly, no separator, no hex-decoding. Binding
-    // identity_hash into the signed message (not just voter_pub_key/poll_id)
-    // is required because the chain has no way to recompute a
-    // document-derived value itself -- it only ever sees this hash, never
-    // the document data behind it. See ShywareLLC/core/services/identity/didit.go.
-    const message = Buffer.from(`${voter_pub_key}${poll_id}${identityHash}`, "utf8");
-    const digest = crypto.createHash("sha256").update(message).digest();
-    const signature = crypto.sign(null, digest, PRIVATE_KEY_OBJ);
-
-    if (!existing) {
-      db.prepare(
-        "INSERT INTO consumed_sessions (session_id, voter_pub_key, poll_id, consumed_at) VALUES (?, ?, ?, ?)"
-      ).run(session_id, voter_pub_key, poll_id, new Date().toISOString());
-    }
-
-    // Deliberately NOT logging documentKey/identityHash's raw inputs --
-    // only the already-non-reversible identityHash itself, same tier as
-    // everything else this audit log records.
-    await logAttestRequest({
-      timestamp, caller, session_id, poll_id, voter_pub_key, identityHash,
-      outcome: "signed", httpStatus: 200
-    });
-
-    res.json({
-      idv_attestation_sig: signature.toString("hex"),
-      identity_hash: identityHash,
-      voter_pub_key,
-      poll_id,
-      session_id,
-    });
-  } catch (err) {
-    console.error("attest error:", err.message);
-    await logAttestRequest({
-      timestamp, caller,
-      session_id: session_id || null, poll_id: poll_id || null,
-      outcome: "internal_error", errorMessage: err.message, httpStatus: 500
-    });
-    res.status(500).json({ error: "internal error" });
-  }
-});
+// POST /attest is installed by voteShareGrants.cjs (installVoteShareRoutes):
+// the device proves its enrolled secret; no Didit session id is accepted.
 
 // -- Didit webhook audit log ---------------------------------------------
 //
