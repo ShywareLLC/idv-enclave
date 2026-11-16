@@ -6,6 +6,8 @@ const { keyAttestationMessage, keyRequestMessage, ballotKeyRequestMessage, verif
 
 const enclave = crypto.generateKeyPairSync("ed25519");
 const enclavePub = enclave.publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("hex");
+const ENROLL_SECRET = "5e".repeat(32);
+const COMMITMENT = crypto.createHash("sha256").update(Buffer.from(ENROLL_SECRET, "hex")).digest("hex");
 const devicePub = crypto.generateKeyPairSync("ed25519").publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("hex");
 
 function setup() {
@@ -16,7 +18,7 @@ function setup() {
     db: new Database(":memory:"),
     privateKey: enclave.privateKey,
     checkDiditSession: async (id) => ({ status: id.startsWith("declined") ? "Declined" : "Approved", uid: "alice",
-      created_at: id.startsWith("old") ? new Date(Date.now() - 2 * 3600e3).toISOString() : id.startsWith("undated") ? undefined : new Date().toISOString(),
+      vendor_data: JSON.stringify({ userId: "alice", device_commitment: COMMITMENT }),
       id_verification: { document_type: "P", country: "USA", document_number: "X123" } }),
     firebaseUidOf: (d) => d.uid,
     documentKeyOf: (d) => `${d.id_verification.document_type}:${d.id_verification.country}:${d.id_verification.document_number}`,
@@ -39,18 +41,18 @@ function keyRequest(enrolled, { userId = "alice", pub = devicePub, timestamp = n
 
 test("a verification enrolls one device, once; the session is useless after that", async () => {
   const { call } = setup();
-  assert.equal((await call("/device-secret/enroll", { session_id: "declined-1", user_id: "alice" })).status, 403);
-  assert.equal((await call("/device-secret/enroll", { session_id: "s1", user_id: "bob" })).status, 403, "alice's verification can't enroll bob");
-  const first = await call("/device-secret/enroll", { session_id: "s1", user_id: "alice" });
+  assert.equal((await call("/device-secret/enroll", { session_id: "declined-1", user_id: "alice", enrollment_secret: ENROLL_SECRET })).status, 403);
+  assert.equal((await call("/device-secret/enroll", { session_id: "s1", user_id: "bob", enrollment_secret: ENROLL_SECRET })).status, 403, "alice's verification can't enroll bob");
+  const first = await call("/device-secret/enroll", { session_id: "s1", user_id: "alice", enrollment_secret: ENROLL_SECRET });
   assert.equal(first.status, 200);
   assert.match(first.body.secret_hex, /^[0-9a-f]{64}$/);
-  const again = await call("/device-secret/enroll", { session_id: "s1", user_id: "alice" });
+  const again = await call("/device-secret/enroll", { session_id: "s1", user_id: "alice", enrollment_secret: ENROLL_SECRET });
   assert.equal(again.status, 409, "whoever learns the session id later gets nothing");
 });
 
 test("only the enrolled device's secret gets its key vouched for", async () => {
   const { call, logged } = setup();
-  const enrolled = (await call("/device-secret/enroll", { session_id: "s1", user_id: "alice" })).body;
+  const enrolled = (await call("/device-secret/enroll", { session_id: "s1", user_id: "alice", enrollment_secret: ENROLL_SECRET })).body;
   const ok = await call("/vote-share/attest-key", keyRequest(enrolled));
   assert.equal(ok.status, 200);
   assert.equal(verifyEd25519(enclavePub, keyAttestationMessage("alice", devicePub), ok.body.key_attestation_sig), true);
@@ -63,7 +65,7 @@ test("only the enrolled device's secret gets its key vouched for", async () => {
 
 test("ballot keys need the enrolled device and its identity key, never a session id", async () => {
   const { call, logged } = setup();
-  const enrolled = (await call("/device-secret/enroll", { session_id: "s1", user_id: "alice" })).body;
+  const enrolled = (await call("/device-secret/enroll", { session_id: "s1", user_id: "alice", enrollment_secret: ENROLL_SECRET })).body;
   assert.match(enrolled.identity_key_hex, /^[0-9a-f]{64}$/);
   const ballot = ({ secret = enrolled.secret_hex, identityKey = enrolled.identity_key_hex, poll = "poll-1" } = {}) => {
     const timestamp = new Date().toISOString();
@@ -82,11 +84,12 @@ test("ballot keys need the enrolled device and its identity key, never a session
   assert.ok(!JSON.stringify(logged).includes("X123"), "the document number is never logged");
 });
 
-test("only a fresh verification can enroll; old or undated sessions age out with nothing stored", async () => {
+test("only the device holding the pre-scan secret can enroll with a session, whoever else knows its id", async () => {
   const { call } = setup();
-  const old = await call("/device-secret/enroll", { session_id: "old-session", user_id: "alice" });
-  assert.equal(old.status, 403);
-  assert.equal(old.body.code, "session_not_fresh");
-  assert.equal((await call("/device-secret/enroll", { session_id: "undated-session", user_id: "alice" })).status, 403, "fails closed");
-  assert.equal((await call("/device-secret/enroll", { session_id: "fresh-session", user_id: "alice" })).status, 200);
+  const other = await call("/device-secret/enroll", { session_id: "s1", user_id: "alice", enrollment_secret: "77".repeat(32) });
+  assert.equal(other.status, 403);
+  assert.equal(other.body.code, "commitment_mismatch");
+  assert.equal((await call("/device-secret/enroll", { session_id: "s1", user_id: "alice" })).status, 400, "no secret at all");
+  assert.equal((await call("/device-secret/enroll", { session_id: "s1", user_id: "alice", enrollment_secret: ENROLL_SECRET })).status, 200,
+    "a failed attempt doesn't burn the session for its owner");
 });

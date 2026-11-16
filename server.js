@@ -447,10 +447,11 @@ app.post("/recovery/enroll", async (req, res) => {
     if (decision.status !== "Approved") {
       return res.status(403).json({ error: `Didit session status is '${decision.status}', not Approved` });
     }
-    // Only a fresh verification: session ids aren't secret (Populist's DB,
-    // logs, the ledger), so an old one must not be able to claim `k`.
-    if (!require("./voteShareGrants.cjs").freshSession(decision, Date.now())) {
-      return res.status(403).json({ error: "This verification is too old to enroll recovery; verify again", code: "session_not_fresh" });
+    // Only the device that started this verification: session ids aren't
+    // secret (Populist's DB, logs, the ledger), so claiming `k` takes the
+    // enrollment secret whose hash Didit carries in vendor_data.
+    if (!require("./voteShareGrants.cjs").matchesCommitment(decision, req.body?.enrollment_secret)) {
+      return res.status(403).json({ error: "This verification wasn't started on this device", code: "commitment_mismatch" });
     }
     const firebaseUid = extractFirebaseUidFromVendorData(decision);
 

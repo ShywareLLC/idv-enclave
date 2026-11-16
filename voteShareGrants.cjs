@@ -3,8 +3,10 @@
 //
 // 1. Device secret (POST /device-secret/enroll). Right after the person's
 //    Didit verification (the face scan) is Approved, the device presents that
-//    session once; the enclave re-checks it with Didit, consumes it for good,
-//    and returns a fresh 32-byte secret it also keeps. From then on a session
+//    session once with the enrollment secret it committed to before the
+//    scan; the enclave re-checks it with Didit, checks the commitment,
+//    consumes the session for good, and returns a fresh 32-byte secret it
+//    also keeps. From then on a session
 //    id is useless here -- whoever learns one later (Populist's server, a log
 //    reader, anyone reading the chain) can't enroll again with it.
 //    It also returns an identity key: the verified document reference is
@@ -30,16 +32,25 @@ const PUB_HEX = /^[0-9a-f]{64}$/;
 const MAC_HEX = /^[0-9a-f]{64}$/;
 const DEVICE_ID = /^[0-9a-f-]{36}$/;
 const MAX_SKEW_MS = 5 * 60 * 1000;
-// A session can enroll only while it's fresh: Didit created it within this
-// window. Old session ids (in Populist's DB, in logs, on the ledger) age out
-// on their own -- nothing about them is listed or stored.
-const MAX_SESSION_AGE_MS = 60 * 60 * 1000;
+/// The phone's enrollment commitment, carried by Didit in vendor_data:
+/// sha256 of a secret the phone generated before verification started. Only
+/// the phone has the secret; Populist (which created the session) saw only
+/// the hash. Enrollment requires the secret, so no one else can enroll with
+/// this session -- whenever and however they learn its id.
+function commitmentOf(decision) {
+  try {
+    const value = JSON.parse(decision?.vendor_data || "{}").device_commitment;
+    return typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
 
-/// Whether Didit created this session recently enough to enroll with.
-/// Fails closed: a missing or unreadable timestamp is not fresh.
-function freshSession(decision, now) {
-  const created = Date.parse(decision?.created_at || "");
-  return Number.isFinite(created) && now - created >= -MAX_SKEW_MS && now - created <= MAX_SESSION_AGE_MS;
+/// Whether `secretHex` is the preimage of this verification's commitment.
+function matchesCommitment(decision, secretHex) {
+  const commitment = commitmentOf(decision);
+  if (!commitment || typeof secretHex !== "string" || !/^[0-9a-f]{64}$/.test(secretHex)) return false;
+  return sameHex(crypto.createHash("sha256").update(Buffer.from(secretHex, "hex")).digest("hex"), commitment);
 }
 
 /// The bytes the enclave signs: newline-joined fields (identical in every language).
@@ -131,9 +142,10 @@ function installVoteShareRoutes(app, { db, privateKey, checkDiditSession, fireba
 
   app.post("/device-secret/enroll", async (req, res) => {
     res.set("Cache-Control", "no-store");
-    const { session_id, user_id } = req.body || {};
-    if (typeof session_id !== "string" || !session_id || typeof user_id !== "string" || !UID.test(user_id)) {
-      return res.status(400).json({ error: "session_id and user_id are required" });
+    const { session_id, user_id, enrollment_secret } = req.body || {};
+    if (typeof session_id !== "string" || !session_id || typeof user_id !== "string" || !UID.test(user_id)
+        || typeof enrollment_secret !== "string" || !/^[0-9a-f]{64}$/.test(enrollment_secret)) {
+      return res.status(400).json({ error: "session_id, user_id and enrollment_secret are required" });
     }
     const hash = sessionHash(session_id);
     if (db.prepare("SELECT 1 FROM consumed_device_secret_sessions WHERE session_hash = ?").get(hash)) {
@@ -152,9 +164,9 @@ function installVoteShareRoutes(app, { db, privateKey, checkDiditSession, fireba
       await log({ timestamp: new Date(now()).toISOString(), user_id, outcome: "verification_failed" });
       return res.status(403).json({ error: "Identity verification failed" });
     }
-    if (!freshSession(decision, now())) {
-      await log({ timestamp: new Date(now()).toISOString(), user_id, outcome: "session_not_fresh" });
-      return res.status(403).json({ error: "This verification is too old to enroll a device; verify again", code: "session_not_fresh" });
+    if (!matchesCommitment(decision, enrollment_secret)) {
+      await log({ timestamp: new Date(now()).toISOString(), user_id, outcome: "commitment_mismatch" });
+      return res.status(403).json({ error: "This verification wasn't started on this device", code: "commitment_mismatch" });
     }
     let documentKey;
     try { documentKey = documentKeyOf(decision); } catch { documentKey = null; }
@@ -237,4 +249,4 @@ function installVoteShareRoutes(app, { db, privateKey, checkDiditSession, fireba
   });
 }
 
-module.exports = { freshSession, keyAttestationMessage, keyRequestMessage, ballotKeyRequestMessage, verifyEd25519, hmacHex, sealDocument, openDocument, installVoteShareRoutes };
+module.exports = { matchesCommitment, keyAttestationMessage, keyRequestMessage, ballotKeyRequestMessage, verifyEd25519, hmacHex, sealDocument, openDocument, installVoteShareRoutes };
