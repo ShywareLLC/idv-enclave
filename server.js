@@ -768,10 +768,14 @@ app.post("/voter-reveal/identity", async (req, res) => {
   }
 });
 
-// POST /vote-share/attest-key -- like /attest: the device calls it directly,
-// the enclave re-checks Didit and vouches for the device's key; the device
-// then signs each vote-share grant itself. See voteShareGrants.cjs.
-require("./voteShareGrants.cjs").installVoteShareKeyRoute(app, {
+// POST /device-secret/enroll -- right after Didit verification, the device
+// presents its session ONCE and gets a secret; the session is consumed.
+// POST /vote-share/attest-key -- the device proves it holds that secret and
+// the enclave vouches for its signing key; the device then signs each
+// vote-share grant itself. A Didit session id alone can do neither.
+// See voteShareGrants.cjs.
+require("./voteShareGrants.cjs").installVoteShareRoutes(app, {
+  db,
   privateKey: PRIVATE_KEY_OBJ,
   checkDiditSession,
   firebaseUidOf: extractFirebaseUidFromVendorData,
