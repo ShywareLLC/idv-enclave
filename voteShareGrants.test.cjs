@@ -16,6 +16,7 @@ function setup() {
     db: new Database(":memory:"),
     privateKey: enclave.privateKey,
     checkDiditSession: async (id) => ({ status: id.startsWith("declined") ? "Declined" : "Approved", uid: "alice",
+      created_at: id.startsWith("old") ? new Date(Date.now() - 2 * 3600e3).toISOString() : id.startsWith("undated") ? undefined : new Date().toISOString(),
       id_verification: { document_type: "P", country: "USA", document_number: "X123" } }),
     firebaseUidOf: (d) => d.uid,
     documentKeyOf: (d) => `${d.id_verification.document_type}:${d.id_verification.country}:${d.id_verification.document_number}`,
@@ -79,4 +80,13 @@ test("ballot keys need the enrolled device and its identity key, never a session
   assert.equal((await call("/attest", ballot({ secret: "22".repeat(32) }))).status, 403, "without the device secret");
   assert.equal((await call("/attest", ballot({ identityKey: "33".repeat(32) }))).status, 403, "without the identity key");
   assert.ok(!JSON.stringify(logged).includes("X123"), "the document number is never logged");
+});
+
+test("only a fresh verification can enroll; old or undated sessions age out with nothing stored", async () => {
+  const { call } = setup();
+  const old = await call("/device-secret/enroll", { session_id: "old-session", user_id: "alice" });
+  assert.equal(old.status, 403);
+  assert.equal(old.body.code, "session_not_fresh");
+  assert.equal((await call("/device-secret/enroll", { session_id: "undated-session", user_id: "alice" })).status, 403, "fails closed");
+  assert.equal((await call("/device-secret/enroll", { session_id: "fresh-session", user_id: "alice" })).status, 200);
 });

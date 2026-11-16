@@ -30,6 +30,17 @@ const PUB_HEX = /^[0-9a-f]{64}$/;
 const MAC_HEX = /^[0-9a-f]{64}$/;
 const DEVICE_ID = /^[0-9a-f-]{36}$/;
 const MAX_SKEW_MS = 5 * 60 * 1000;
+// A session can enroll only while it's fresh: Didit created it within this
+// window. Old session ids (in Populist's DB, in logs, on the ledger) age out
+// on their own -- nothing about them is listed or stored.
+const MAX_SESSION_AGE_MS = 60 * 60 * 1000;
+
+/// Whether Didit created this session recently enough to enroll with.
+/// Fails closed: a missing or unreadable timestamp is not fresh.
+function freshSession(decision, now) {
+  const created = Date.parse(decision?.created_at || "");
+  return Number.isFinite(created) && now - created >= -MAX_SKEW_MS && now - created <= MAX_SESSION_AGE_MS;
+}
 
 /// The bytes the enclave signs: newline-joined fields (identical in every language).
 function keyAttestationMessage(userId, pubKeyHex) {
@@ -141,6 +152,10 @@ function installVoteShareRoutes(app, { db, privateKey, checkDiditSession, fireba
       await log({ timestamp: new Date(now()).toISOString(), user_id, outcome: "verification_failed" });
       return res.status(403).json({ error: "Identity verification failed" });
     }
+    if (!freshSession(decision, now())) {
+      await log({ timestamp: new Date(now()).toISOString(), user_id, outcome: "session_not_fresh" });
+      return res.status(403).json({ error: "This verification is too old to enroll a device; verify again", code: "session_not_fresh" });
+    }
     let documentKey;
     try { documentKey = documentKeyOf(decision); } catch { documentKey = null; }
     if (!documentKey) return res.status(403).json({ error: "The verification has no identity document" });
@@ -174,7 +189,9 @@ function installVoteShareRoutes(app, { db, privateKey, checkDiditSession, fireba
     if (!Number.isFinite(at) || Math.abs(now() - at) > MAX_SKEW_MS) {
       return res.status(400).json({ error: "The request is stale; sign it again" });
     }
-    const device = provenDevice(db, user_id, device_id, keyRequestMessage(user_id, device_id, pub_key, timestamp).split("\n"), mac);
+    const proven = provenDevice(db, user_id, device_id, keyRequestMessage(user_id, device_id, pub_key, timestamp).split("\n"), mac);
+    // Enrollments from before freshness and document sealing don't count.
+    const device = proven?.document_ct ? proven : null;
     if (!device) {
       await log({ timestamp: new Date(now()).toISOString(), user_id, device_id, outcome: "device_proof_failed" });
       return res.status(403).json({ error: "This device isn't enrolled for this account", code: "device_not_enrolled" });
@@ -220,4 +237,4 @@ function installVoteShareRoutes(app, { db, privateKey, checkDiditSession, fireba
   });
 }
 
-module.exports = { keyAttestationMessage, keyRequestMessage, ballotKeyRequestMessage, verifyEd25519, hmacHex, sealDocument, openDocument, installVoteShareRoutes };
+module.exports = { freshSession, keyAttestationMessage, keyRequestMessage, ballotKeyRequestMessage, verifyEd25519, hmacHex, sealDocument, openDocument, installVoteShareRoutes };

@@ -447,6 +447,11 @@ app.post("/recovery/enroll", async (req, res) => {
     if (decision.status !== "Approved") {
       return res.status(403).json({ error: `Didit session status is '${decision.status}', not Approved` });
     }
+    // Only a fresh verification: session ids aren't secret (Populist's DB,
+    // logs, the ledger), so an old one must not be able to claim `k`.
+    if (!require("./voteShareGrants.cjs").freshSession(decision, Date.now())) {
+      return res.status(403).json({ error: "This verification is too old to enroll recovery; verify again", code: "session_not_fresh" });
+    }
     const firebaseUid = extractFirebaseUidFromVendorData(decision);
 
     const existing = db.prepare("SELECT k_hex FROM recovery_keys WHERE firebase_uid = ?").get(firebaseUid);
