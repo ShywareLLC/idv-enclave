@@ -768,6 +768,93 @@ app.post("/voter-reveal/identity", async (req, res) => {
   }
 });
 
+// POST /vote-share/grant -- verifies the granter (only), then signs an
+// ongoing vote-share grant naming the grantee's account. See voteShareGrants.cjs.
+require("./voteShareGrants.cjs").installVoteShareGrantRoute(app, {
+  privateKey: PRIVATE_KEY_OBJ,
+  checkDiditSession,
+  firebaseUidOf: extractFirebaseUidFromVendorData,
+  authorized: (req) => {
+    const auth = req.get("authorization") || "";
+    return timingSafeEqual(auth.startsWith("Bearer ") ? auth.slice(7) : "", POLL_SIGNING_SHARED_SECRET);
+  },
+  async logGrant(record) {
+    try {
+      const client = await getObjectStorageClient();
+      await client.putObject({
+        namespaceName: AUDIT_LOG_NAMESPACE,
+        bucketName: AUDIT_LOG_BUCKET,
+        objectName: `vote-share-grants/${record.timestamp}-${record.grant_id}.json`,
+        putObjectBody: Buffer.from(JSON.stringify(record)),
+        contentType: "application/json"
+      });
+    } catch (err) {
+      console.error("vote-share grant log error:", err.message);
+    }
+  }
+});
+
+// POST /verification/attest -- independently verifies a Didit approval and
+// binds it to the Firebase account carried in Didit's vendor_data.
+app.post("/verification/attest", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  const { session_id, user_id } = req.body || {};
+  if (typeof session_id !== "string" || !session_id ||
+      typeof user_id !== "string" || !user_id) {
+    return res.status(400).json({ error: "session_id and user_id are required" });
+  }
+
+  try {
+    const decision = await checkDiditSession(session_id);
+    const decisionUserId = extractFirebaseUidFromVendorData(decision);
+    if (decision.status !== "Approved" || decisionUserId !== user_id) {
+      await logAttestRequest({
+        timestamp: new Date().toISOString(),
+        session_id,
+        user_id,
+        outcome: "verification_not_approved",
+        diditStatus: decision.status,
+        httpStatus: 403
+      });
+      return res.status(403).json({ error: "Identity verification failed" });
+    }
+
+    const decisionHash = crypto.createHash("sha256")
+      .update(JSON.stringify(decision), "utf8")
+      .digest("hex");
+    const evidence = {
+      contract: "shyware-didit-verification-attestation-v1",
+      session_id,
+      user_id,
+      status: "Approved",
+      decision_hash: decisionHash
+    };
+    const message = Buffer.from([
+      evidence.contract,
+      evidence.session_id,
+      evidence.user_id,
+      evidence.status,
+      evidence.decision_hash
+    ].join("\0"), "utf8");
+    const signature = crypto.sign(null, message, PRIVATE_KEY_OBJ);
+    await logAttestRequest({
+      timestamp: new Date().toISOString(),
+      session_id,
+      user_id,
+      outcome: "verification_signed",
+      decisionHash,
+      httpStatus: 200
+    });
+    return res.json({
+      ...evidence,
+      signature_hex: signature.toString("hex")
+    });
+  } catch (err) {
+    console.error("verification/attest error:", err.message);
+    return res.status(503).json({ error: "Identity verification unavailable" });
+  }
+});
+
 // Paired envelopes are checked here privately; only independently sorted lists
 // and the admission authority signature are returned for ledger publication.
 const reconciliationPublicKey = process.env.RECONCILIATION_PUBLIC_KEY_HEX ? crypto.createPublicKey({key:Buffer.concat([Buffer.from("302a300506032b6570032100","hex"),Buffer.from(process.env.RECONCILIATION_PUBLIC_KEY_HEX,"hex")]),type:"spki",format:"der"}) : null;

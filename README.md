@@ -39,6 +39,10 @@ per the docs page above.
 - `POST /audit-log` — forwards an already-HMAC-validated Didit webhook record
   to OCI Object Storage for durable, append-only storage. Shared-secret auth
   for the same reason as above.
+- `POST /verification/attest` — independently checks the Didit session,
+  verifies that Didit's `vendor_data.userId` matches the requested Firebase
+  UID, and signs the approved result. Populist must verify this signature
+  before persisting a verified profile.
 - `POST /publication/admit` — privately verifies the original device/enrollment
   envelopes and a fresh ledger snapshot, then authorizes two independently
   sorted complete public lists. The returned transaction contains no device
