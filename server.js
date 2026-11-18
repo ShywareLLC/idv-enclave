@@ -807,6 +807,32 @@ require("./voteShareGrants.cjs").installVoteShareRoutes(app, {
   }
 });
 
+// POST /participation-stamp -- "I voted" stamps; see participationStamp.cjs.
+require("./participationStamp.cjs").installParticipationStamp(app, {
+  db,
+  privateKey: PRIVATE_KEY_OBJ,
+  async readInspection(pollId) {
+    if (!RELAY_BASE_URL) throw new Error("RELAY_BASE_URL not set");
+    const response = await fetch(`${RELAY_BASE_URL.replace(/\/$/, "")}/polls/${encodeURIComponent(pollId)}/inspection`, { signal: AbortSignal.timeout(10000) });
+    if (!response.ok) throw new Error(`inspection HTTP ${response.status}`);
+    return response.json();
+  },
+  async log(record) {
+    try {
+      const client = await getObjectStorageClient();
+      await client.putObject({
+        namespaceName: AUDIT_LOG_NAMESPACE,
+        bucketName: AUDIT_LOG_BUCKET,
+        objectName: `participation-stamps/${record.timestamp}-${crypto.randomUUID()}.json`,
+        putObjectBody: Buffer.from(JSON.stringify(record)),
+        contentType: "application/json"
+      });
+    } catch (err) {
+      console.error("participation stamp log error:", err.message);
+    }
+  }
+});
+
 // POST /verification/attest -- independently verifies a Didit approval and
 // binds it to the Firebase account carried in Didit's vendor_data.
 app.post("/verification/attest", async (req, res) => {

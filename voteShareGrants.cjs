@@ -257,4 +257,4 @@ function installVoteShareRoutes(app, { db, privateKey, checkDiditSession, fireba
   });
 }
 
-module.exports = { matchesCommitment, keyAttestationMessage, keyRequestMessage, ballotKeyRequestMessage, verifyEd25519, hmacHex, sealDocument, openDocument, installVoteShareRoutes };
+module.exports = { matchesCommitment, keyAttestationMessage, keyRequestMessage, ballotKeyRequestMessage, verifyEd25519, hmacHex, sealDocument, openDocument, provenDevice, UID, DEVICE_ID, MAC_HEX, PUB_HEX, MAX_SKEW_MS, installVoteShareRoutes };
