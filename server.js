@@ -296,13 +296,15 @@ async function getObjectStorageClient() {
 // x-api-key correctly, which is why verification itself worked while this
 // independent re-check never could.
 async function checkDiditSession(sessionId) {
-  const res = await fetch(`https://verification.didit.me/v2/session/${encodeURIComponent(sessionId)}/decision/`, {
+  const res = await fetch(`https://verification.didit.me/v3/session/${encodeURIComponent(sessionId)}/decision/`, {
     headers: { "x-api-key": diditApiKey }
   });
   if (!res.ok) {
     throw new Error(`Didit API returned ${res.status}`);
   }
-  return res.json();
+  // v3 lists features as arrays (id_verifications, poa_verifications, ...);
+  // the normalizer adds the singular names this service reads.
+  return require("./diditDecision.cjs").normalizeDiditDecision(await res.json());
 }
 
 // Used by /attest's replay-guard grace window: a (session_id, poll_id) slot
