@@ -27,7 +27,8 @@
 
 const crypto = require("node:crypto");
 
-const UID = /^[A-Za-z0-9:_-]{1,128}$/;
+// Firebase UIDs, including Apple sign-in ones ("apple:001234.abc….0456").
+const UID = /^[A-Za-z0-9:._-]{1,128}$/;
 const PUB_HEX = /^[0-9a-f]{64}$/;
 const MAC_HEX = /^[0-9a-f]{64}$/;
 const DEVICE_ID = /^[0-9a-f-]{36}$/;
