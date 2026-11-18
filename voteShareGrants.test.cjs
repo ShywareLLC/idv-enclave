@@ -89,7 +89,9 @@ test("only the device holding the pre-scan secret can enroll with a session, who
   const other = await call("/device-secret/enroll", { session_id: "s1", user_id: "alice", enrollment_secret: "77".repeat(32) });
   assert.equal(other.status, 403);
   assert.equal(other.body.code, "commitment_mismatch");
-  assert.equal((await call("/device-secret/enroll", { session_id: "s1", user_id: "alice" })).status, 400, "no secret at all");
+  const noSecret = await call("/device-secret/enroll", { session_id: "s1", user_id: "alice" });
+  assert.equal(noSecret.status, 400, "no secret at all");
+  assert.match(noSecret.body.error, /enrollment_secret missing/);
   assert.equal((await call("/device-secret/enroll", { session_id: "s1", user_id: "alice", enrollment_secret: ENROLL_SECRET })).status, 200,
     "a failed attempt doesn't burn the session for its owner");
 });

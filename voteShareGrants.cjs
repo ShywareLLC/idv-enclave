@@ -143,9 +143,16 @@ function installVoteShareRoutes(app, { db, privateKey, checkDiditSession, fireba
   app.post("/device-secret/enroll", async (req, res) => {
     res.set("Cache-Control", "no-store");
     const { session_id, user_id, enrollment_secret } = req.body || {};
-    if (typeof session_id !== "string" || !session_id || typeof user_id !== "string" || !UID.test(user_id)
-        || typeof enrollment_secret !== "string" || !/^[0-9a-f]{64}$/.test(enrollment_secret)) {
-      return res.status(400).json({ error: "session_id, user_id and enrollment_secret are required" });
+    // Name each problem (never the values), so a client can tell an old SDK
+    // that sends no secret from a malformed field.
+    const problems = [
+      ...(typeof session_id !== "string" || !session_id ? ["session_id missing"] : []),
+      ...(typeof user_id !== "string" ? ["user_id missing"] : !UID.test(user_id) ? ["user_id malformed"] : []),
+      ...(enrollment_secret == null ? ["enrollment_secret missing (an app built before the pre-scan secret)"]
+        : typeof enrollment_secret !== "string" || !/^[0-9a-f]{64}$/.test(enrollment_secret) ? ["enrollment_secret malformed (64 lowercase hex expected)"] : [])
+    ];
+    if (problems.length) {
+      return res.status(400).json({ error: `Enrollment request rejected: ${problems.join("; ")}`, problems });
     }
     const hash = sessionHash(session_id);
     if (db.prepare("SELECT 1 FROM consumed_device_secret_sessions WHERE session_hash = ?").get(hash)) {
