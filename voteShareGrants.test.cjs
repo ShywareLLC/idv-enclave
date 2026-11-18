@@ -8,6 +8,7 @@ const enclave = crypto.generateKeyPairSync("ed25519");
 const enclavePub = enclave.publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("hex");
 const ENROLL_SECRET = "5e".repeat(32);
 const COMMITMENT = crypto.createHash("sha256").update(Buffer.from(ENROLL_SECRET, "hex")).digest("hex");
+require("./identityHash.cjs").configureIdentityHash(enclave.privateKey);
 const devicePub = crypto.generateKeyPairSync("ed25519").publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("hex");
 
 function setup() {
@@ -74,7 +75,8 @@ test("ballot keys need the enrolled device and its identity key, never a session
   };
   const ok = await call("/attest", ballot());
   assert.equal(ok.status, 200);
-  const expected = crypto.createHash("sha256").update("P:USA:X123poll-1").digest("hex");
+  const expected = require("./identityHash.cjs").identityHashOf("P:USA:X123", "poll-1");
+  assert.notEqual(expected, crypto.createHash("sha256").update("P:USA:X123poll-1").digest("hex"), "not the plain v1 hash anyone could recompute");
   assert.equal(ok.body.identity_hash, expected, "the same identity_hash as the session-based attest computed");
   const digest = crypto.createHash("sha256").update(devicePub + "poll-1" + expected).digest();
   assert.equal(crypto.verify(null, digest, enclave.publicKey, Buffer.from(ok.body.idv_attestation_sig, "hex")), true, "what the chain verifies");

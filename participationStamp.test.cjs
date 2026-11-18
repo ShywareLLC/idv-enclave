@@ -10,7 +10,9 @@ const ENROLL_SECRET = "5e".repeat(32);
 const COMMITMENT = crypto.createHash("sha256").update(Buffer.from(ENROLL_SECRET, "hex")).digest("hex");
 const POLL = "6f0e0f8a-1111-4222-8333-944445555666";
 const sha = (s) => crypto.createHash("sha256").update(Buffer.from(s, "utf8")).digest("hex");
-const aliceHash = sha("P:USA:X123" + POLL);
+const { configureIdentityHash, identityHashOf } = require("./identityHash.cjs");
+configureIdentityHash(enclave.privateKey);
+const aliceHash = identityHashOf("P:USA:X123", POLL);
 
 function snapshot(voters, votes = voters.map((_, i) => ({ ballot_id: `ballot-${i}`, choices: ["yes"] }))) {
   const records = JSON.stringify({ contract: "shyvoting-inspection-v1", poll: { poll_id: POLL }, votes, voters: voters.map((identity_hash) => ({ identity_hash })) });

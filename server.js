@@ -122,6 +122,7 @@ function loadOrGenerateKeypair() {
 const { privateKey: PRIVATE_KEY_PEM, publicKey: PUBLIC_KEY_PEM } = loadOrGenerateKeypair();
 const PRIVATE_KEY_OBJ = crypto.createPrivateKey(PRIVATE_KEY_PEM);
 const PUBLIC_KEY_OBJ = crypto.createPublicKey(PUBLIC_KEY_PEM);
+require("./identityHash.cjs").configureIdentityHash(PRIVATE_KEY_OBJ);
 // Raw 32-byte Ed25519 public key, hex-encoded -- this is what gets
 // configured as --didit-pubkey on the Go core's DiditVerifier.
 const PUBLIC_KEY_HEX = PUBLIC_KEY_OBJ.export({ type: "spki", format: "der" })
@@ -749,7 +750,7 @@ function documentIdentityHash(decision, pollId) {
   const idv = decision.id_verification || {};
   if (!idv.document_number) throw new Error("Verified document identity is unavailable");
   const documentKey = `${idv.document_type || ""}:${idv.issuing_state || idv.country || ""}:${idv.document_number}`;
-  return crypto.createHash("sha256").update(Buffer.from(documentKey + pollId, "utf8")).digest("hex");
+  return require("./identityHash.cjs").identityHashOf(documentKey, pollId);
 }
 
 app.post("/voter-reveal/identity", async (req, res) => {

@@ -14,7 +14,7 @@
 //    keep, so this database alone reveals no document numbers.
 // 1b. Ballot keys (POST /attest). The device proves it holds the secret and
 //    presents the identity key; the enclave decrypts the document reference
-//    in memory, computes the poll's identity_hash exactly as before and signs
+//    in memory, computes the poll's identity_hash (identityHash.cjs) and signs
 //    the same statement the chain verifies.
 // 2. Key statement (POST /vote-share/attest-key). The device proves it holds
 //    the secret with an HMAC over (account, device, its signing key, time);
@@ -26,6 +26,7 @@
 // never in the access path.
 
 const crypto = require("node:crypto");
+const { identityHashOf } = require("./identityHash.cjs");
 
 // Firebase UIDs, including Apple sign-in ones ("apple:001234.abc….0456").
 const UID = /^[A-Za-z0-9:._-]{1,128}$/;
@@ -247,7 +248,7 @@ function installVoteShareRoutes(app, { db, privateKey, checkDiditSession, fireba
       await logAttest({ timestamp, poll_id, outcome: "identity_key_failed", httpStatus: 403 });
       return res.status(403).json({ error: "Identity key doesn't match this device", code: "device_not_enrolled" });
     }
-    const identityHash = crypto.createHash("sha256").update(Buffer.from(documentKey + poll_id, "utf8")).digest("hex");
+    const identityHash = identityHashOf(documentKey, poll_id);
     db.prepare("INSERT OR IGNORE INTO authorized_vote_devices(poll_id,identity_hash,voter_pub_key) VALUES (?,?,?)").run(poll_id, identityHash, voter_pub_key);
     const digest = crypto.createHash("sha256").update(Buffer.from(`${voter_pub_key}${poll_id}${identityHash}`, "utf8")).digest();
     const signature = crypto.sign(null, digest, privateKey);

@@ -3,8 +3,7 @@
 //
 // A ballot ID is public alongside its choices, so sharing one shares the
 // vote. A participant entry (identity_hash) carries no choice, but it is a
-// plain hash of document details and poll ID, so publishing one beside a name
-// invites brute-forcing the document number. A stamp carries neither.
+// stable per-poll handle for the person; a stamp carries neither.
 //
 // POST /participation-stamp. The device proves its enrolled secret (HMAC, as
 // for /attest) and presents its identity key. The enclave computes the
@@ -19,6 +18,7 @@
 // Trust: the stamp says "this enclave checked". Anyone can check the
 // signature with the enclave's public key; nobody can check who it was for.
 const crypto = require("node:crypto");
+const { identityHashOf } = require("./identityHash.cjs");
 const { provenDevice, openDocument, UID, DEVICE_ID, MAC_HEX, PUB_HEX, MAX_SKEW_MS } = require("./voteShareGrants.cjs");
 
 const POLL_ID = /^[0-9A-Fa-f-]{1,128}$/;
@@ -80,7 +80,7 @@ function installParticipationStamp(app, { db, privateKey, readInspection, log = 
       await log({ timestamp: new Date(now()).toISOString(), outcome: "device_proof_failed" });
       return res.status(403).json({ error: "This device isn't enrolled for this account", code: "device_not_enrolled" });
     }
-    const identityHash = crypto.createHash("sha256").update(Buffer.from(documentKey + poll_id, "utf8")).digest("hex");
+    const identityHash = identityHashOf(documentKey, poll_id);
     let snapshot;
     try { snapshot = await readInspection(poll_id); } catch { return res.status(503).json({ error: "Ledger unavailable" }); }
     let counted = false;
